@@ -1,0 +1,445 @@
+/* CMSAWK 0.2: a CMS-hosted AWK core implemented in C for GCCCMS. */
+/* Invocation: CMSAWK script-fn script-ft script-fm data-fn data-ft data-fm */
+/* Script: one rule per line; BEGIN/END; /regex/; print item[,item...]. */
+/* Items: $0-$9, NR, NF, quoted strings, and numeric literals. */
+/* Regex: ^ $ . * + ? and simple [abc]/[^abc] character classes. */
+/* Data: CMS text records up to 1023 bytes; blank/tab default field split. */
+/* No assignments, arrays, functions or control-flow statements yet. */
+typedef struct cms_file FILE;
+extern FILE *fopen(const char *, const char *);
+extern char *fgets(char *, int, FILE *);
+extern int fclose(FILE *);
+extern int puts(const char *);
+extern int printf(const char *, ...);
+enum {
+    MAX_RULES = 16,
+    MAX_ITEMS = 8,
+    MAX_PATTERN = 128,
+    MAX_STRING = 128,
+    MAX_RECORD = 1024,
+    MAX_FIELDS = 64,
+    RULE_NORMAL = 0,
+    RULE_BEGIN = 1,
+    RULE_END = 2,
+    ITEM_FIELD = 0,
+    ITEM_NR = 1,
+    ITEM_NF = 2,
+    ITEM_STRING = 3
+};
+typedef struct {
+    int kind;
+    int field;
+    int length;
+    char text[MAX_STRING];
+} AwkItem;
+typedef struct {
+    int kind;
+    int pattern_length;
+    char pattern[MAX_PATTERN];
+    int item_count;
+    AwkItem item[MAX_ITEMS];
+} AwkRule;
+typedef struct {
+    int start;
+    int length;
+} AwkField;
+static AwkRule rules[MAX_RULES];
+static int rule_count;
+static unsigned long nr;
+static int nf;
+static AwkField fields[MAX_FIELDS];
+static int text_length(const char *s) {
+    int n = 0;
+    while (s[n]) n++;
+    return n;
+}
+static int is_space(char c) {
+    return c == ' ' || c == '\t';
+}
+static char *skip_space(char *p) {
+    while (is_space(*p)) p++;
+    return p;
+}
+static int starts_word(const char *p, const char *word) {
+    int n = text_length(word);
+    int i;
+    for (i = 0; i < n; i++)
+        if (!p[i] || p[i] != word[i]) return 0;
+    return is_space(p[n]) || p[n] == '{' || p[n] == '}' ||
+           p[n] == ',' || p[n] == 0;
+}
+static int number_text(unsigned long value, char *out) {
+    char reversed[24];
+    int count = 0;
+    int i;
+    do {
+        reversed[count++] = (char)('0' + value % 10);
+        value /= 10;
+    } while (value && count < 24);
+    for (i = 0; i < count; i++) out[i] = reversed[count - i - 1];
+    out[count] = 0;
+    return count;
+}
+static int parse_item(char **cursor, AwkItem *item) {
+    char *p = skip_space(*cursor);
+    int n = 0;
+    item->kind = ITEM_FIELD;
+    item->field = 0;
+    item->length = 0;
+    item->text[0] = 0;
+    if (*p == '$') {
+        p++;
+        if (*p < '0' || *p > '9') return 0;
+        item->field = *p - '0';
+        p++;
+        *cursor = p;
+        return 1;
+    }
+    if (starts_word(p, "NR")) {
+        item->kind = ITEM_NR;
+        *cursor = p + 2;
+        return 1;
+    }
+    if (starts_word(p, "NF")) {
+        item->kind = ITEM_NF;
+        *cursor = p + 2;
+        return 1;
+    }
+    item->kind = ITEM_STRING;
+    if (*p == '"') {
+        p++;
+        while (*p && *p != '"') {
+            char c = *p++;
+            if (c == '\\') {
+                if (!*p) return 0;
+                c = *p++;
+                if (c == 'n') c = '\n';
+                else if (c == 't') c = '\t';
+                else if (c != '\\' && c != '"') return 0;
+            }
+            if (n >= MAX_STRING - 1) return 0;
+            item->text[n++] = c;
+        }
+        if (*p != '"') return 0;
+        p++;
+    } else if ((*p >= '0' && *p <= '9') ||
+               (*p == '-' && p[1] >= '0' && p[1] <= '9')) {
+        while ((*p >= '0' && *p <= '9') || *p == '.' ||
+               (*p == '-' && n == 0)) {
+            if (n >= MAX_STRING - 1) return 0;
+            item->text[n++] = *p++;
+        }
+    } else {
+        return 0;
+    }
+    item->text[n] = 0;
+    item->length = n;
+    *cursor = p;
+    return 1;
+}
+static int parse_rule(char *line, AwkRule *rule) {
+    char *p = skip_space(line);
+    int n = 0;
+    int closed = 0;
+    int i;
+    if (!*p || *p == '#') return 0;
+    rule->kind = RULE_NORMAL;
+    rule->pattern_length = 0;
+    rule->pattern[0] = 0;
+    rule->item_count = 0;
+    for (i = 0; i < MAX_ITEMS; i++) {
+        rule->item[i].kind = ITEM_FIELD;
+        rule->item[i].field = 0;
+        rule->item[i].length = 0;
+        rule->item[i].text[0] = 0;
+    }
+    if (starts_word(p, "BEGIN")) {
+        rule->kind = RULE_BEGIN;
+        p = skip_space(p + 5);
+    } else if (starts_word(p, "END")) {
+        rule->kind = RULE_END;
+        p = skip_space(p + 3);
+    } else if (*p == '/') {
+        int escaped = 0;
+        p++;
+        while (*p) {
+            char c = *p++;
+            if (!escaped && c == '/') {
+                closed = 1;
+                break;
+            }
+            if (n >= MAX_PATTERN - 1) return -1;
+            rule->pattern[n++] = c;
+            if (escaped) escaped = 0;
+            else if (c == '\\') escaped = 1;
+        }
+        if (!closed) return -1;
+        rule->pattern[n] = 0;
+        rule->pattern_length = n;
+        p = skip_space(p);
+    } else {
+        p = skip_space(p);
+    }
+    if (*p++ != '{') return -1;
+    p = skip_space(p);
+    if (!starts_word(p, "print")) return -1;
+    p = skip_space(p + 5);
+    if (*p == '}') {
+        rule->item_count = 1;
+        rule->item[0].kind = ITEM_FIELD;
+        rule->item[0].field = 0;
+        p++;
+    } else {
+        for (;;) {
+            if (rule->item_count >= MAX_ITEMS) return -1;
+            if (!parse_item(&p, &rule->item[rule->item_count])) return -1;
+            rule->item_count++;
+            p = skip_space(p);
+            if (*p == ',') {
+                p = skip_space(p + 1);
+                continue;
+            }
+            if (*p != '}') return -1;
+            p++;
+            break;
+        }
+    }
+    p = skip_space(p);
+    if (*p && *p != '#') return -1;
+    return 1;
+}
+static int atom_match(const char **pattern, char text) {
+    const char *p = *pattern;
+    int negate = 0;
+    int matched = 0;
+    if (*p == '.') {
+        *pattern = p + 1;
+        return text != 0;
+    }
+    if (*p == '\\' && p[1]) {
+        *pattern = p + 2;
+        return p[1] == text;
+    }
+    if (*p != '[') {
+        if (*p) *pattern = p + 1;
+        return *p == text;
+    }
+    p++;
+    if (*p == '^') {
+        negate = 1;
+        p++;
+    }
+    while (*p && *p != ']') {
+        if (p[1] == '-' && p[2] && p[2] != ']') {
+            if (text >= p[0] && text <= p[2]) matched = 1;
+            p += 3;
+        } else {
+            if (*p == text) matched = 1;
+            p++;
+        }
+    }
+    if (*p != ']') {
+        *pattern = *pattern + 1;
+        return text == '[';
+    }
+    *pattern = p + 1;
+    return negate ? !matched : matched;
+}
+static int match_here(const char *pattern, const char *text);
+static int match_star(const char *atom, const char *rest, const char *text) {
+    const char *next;
+    if (match_here(rest, text)) return 1;
+    while (*text) {
+        next = atom;
+        if (!atom_match(&next, *text)) break;
+        text++;
+        if (match_here(rest, text)) return 1;
+    }
+    return 0;
+}
+static int match_here(const char *pattern, const char *text) {
+    const char *next = pattern;
+    int matched;
+    if (!*pattern) return 1;
+    if (*pattern == '$' && pattern[1] == 0) return *text == 0;
+    matched = atom_match(&next, *text);
+    if (*next == '*') return match_star(pattern, next + 1, text);
+    if (*next == '+')
+        return matched && match_star(pattern, next + 1, text + 1);
+    if (*next == '?') {
+        next++;
+        if (matched && match_here(next, text + 1)) return 1;
+        return match_here(next, text);
+    }
+    if (!matched) return 0;
+    return match_here(next, text + 1);
+}
+static int regex_match(const char *pattern, const char *text) {
+    const char *p = pattern;
+    if (*p == '^') return match_here(p + 1, text);
+    for (;;) {
+        if (match_here(p, text)) return 1;
+        if (!*text) return 0;
+        text++;
+    }
+}
+static void split_record(const char *record, int length) {
+    int i = 0;
+    nf = 0;
+    while (i < length) {
+        int start;
+        while (i < length && (record[i] == ' ' || record[i] == '\t')) i++;
+        if (i >= length) break;
+        start = i;
+        while (i < length && record[i] != ' ' && record[i] != '\t') i++;
+        if (nf < MAX_FIELDS) {
+            fields[nf].start = start;
+            fields[nf].length = i - start;
+        }
+        nf++;
+    }
+}
+static int append(char *out, int *used, const char *text, int length) {
+    int i;
+    if (length < 0 || *used + length >= MAX_RECORD * 4) return 0;
+    for (i = 0; i < length; i++) out[(*used)++] = text[i];
+    out[*used] = 0;
+    return 1;
+}
+static int print_rule(const AwkRule *rule, const char *record,
+                      int reclen, unsigned long recno, int fields_count) {
+    char out[MAX_RECORD * 4];
+    char numbuf[24];
+    int used = 0;
+    int i;
+    out[0] = 0;
+    for (i = 0; i < rule->item_count; i++) {
+        const AwkItem *item = &rule->item[i];
+        const char *text = "";
+        int length = 0;
+        if (i && !append(out, &used, " ", 1)) return 0;
+        if (item->kind == ITEM_FIELD) {
+            if (item->field == 0) {
+                text = record;
+                length = reclen;
+            } else if (item->field <= fields_count &&
+                       item->field <= MAX_FIELDS) {
+                text = record + fields[item->field - 1].start;
+                length = fields[item->field - 1].length;
+            }
+        } else if (item->kind == ITEM_NR) {
+            length = number_text(recno, numbuf);
+            text = numbuf;
+        } else if (item->kind == ITEM_NF) {
+            length = number_text((unsigned long)fields_count, numbuf);
+            text = numbuf;
+        } else {
+            text = item->text;
+            length = item->length;
+        }
+        if (!append(out, &used, text, length)) return 0;
+    }
+    puts(out);
+    return 1;
+}
+static void trim_record(char *line) {
+    int n = text_length(line);
+    while (n > 0 && (line[n - 1] == '\n' || line[n - 1] == '\r' ||
+                     line[n - 1] == ' ')) line[--n] = 0;
+}
+static int make_file_id(char *out, const char *fn,
+                        const char *ft, const char *fm) {
+    int i = 0;
+    while (*fn) out[i++] = *fn++;
+    out[i++] = ' ';
+    while (*ft) out[i++] = *ft++;
+    out[i++] = ' ';
+    while (*fm) out[i++] = *fm++;
+    out[i] = 0;
+    return i;
+}
+int main(int argc, char **argv) {
+    char script_id[32], data_id[32], line[MAX_RECORD];
+    char last_record[MAX_RECORD];
+    FILE *script, *data;
+    int i, last_nf = 0;
+    if (argc != 7) {
+        puts("Usage: CMSAWK scriptFN scriptFT scriptFM dataFN dataFT dataFM");
+        return 4;
+    }
+    make_file_id(script_id, argv[1], argv[2], argv[3]);
+    make_file_id(data_id, argv[4], argv[5], argv[6]);
+    script = fopen(script_id, "r");
+    if (!script) {
+        puts("CMSAWK: cannot open script file");
+        return 8;
+    }
+    rule_count = 0;
+    while (fgets(line, sizeof line, script)) {
+        int parsed;
+        trim_record(line);
+        if (!*skip_space(line) || *skip_space(line) == '#') continue;
+        if (rule_count >= MAX_RULES) {
+            fclose(script);
+            puts("CMSAWK: rule limit exceeded");
+            return 4;
+        }
+        parsed = parse_rule(line, &rules[rule_count]);
+        if (parsed == 0) continue;
+        if (parsed < 0) {
+            printf("CMSAWK invalid rule %d: %s\n", rule_count + 1, line);
+            fclose(script);
+            puts("CMSAWK: invalid rule or rule limit exceeded");
+            return 4;
+        }
+        rule_count++;
+    }
+    fclose(script);
+    nr = 0;
+    nf = 0;
+    last_record[0] = 0;
+    for (i = 0; i < rule_count; i++) {
+        if (rules[i].kind == RULE_BEGIN &&
+            !print_rule(&rules[i], "", 0, nr, nf)) return 8;
+    }
+    data = fopen(data_id, "r");
+    if (!data) {
+        puts("CMSAWK: cannot open data file");
+        return 8;
+    }
+    while (fgets(line, sizeof line, data)) {
+        int length;
+        trim_record(line);
+        length = text_length(line);
+        nr++;
+        split_record(line, length);
+        last_nf = nf;
+        if (length >= MAX_RECORD) {
+            fclose(data);
+            puts("CMSAWK: input record too long");
+            return 8;
+        }
+        {
+            int j;
+            for (j = 0; j <= length; j++) last_record[j] = line[j];
+        }
+        for (i = 0; i < rule_count; i++) {
+            if (rules[i].kind == RULE_NORMAL &&
+                (!rules[i].pattern_length ||
+                 regex_match(rules[i].pattern, line))) {
+                if (!print_rule(&rules[i], line, length, nr, nf)) {
+                    fclose(data);
+                    puts("CMSAWK: print output too long");
+                    return 8;
+                }
+            }
+        }
+    }
+    fclose(data);
+    for (i = 0; i < rule_count; i++) {
+        if (rules[i].kind == RULE_END &&
+            !print_rule(&rules[i], last_record, text_length(last_record),
+                        nr, last_nf)) return 8;
+    }
+    return 0;
+}
