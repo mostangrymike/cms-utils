@@ -1,10 +1,11 @@
-/* CMSAWK 0.2: a CMS-hosted AWK core implemented in C for GCCCMS. */
+/* CMSAWK 0.3: CMS-hosted AWK core implemented in C for GCCCMS. */
 /* Invocation: CMSAWK script-fn script-ft script-fm data-fn data-ft data-fm */
 /* Script: one rule per line; BEGIN/END; /regex/; print item[,item...]. */
 /* Items: $0-$9, NR, NF, quoted strings, and numeric literals. */
 /* Regex: ^ $ . * + ? and simple [abc]/[^abc] character classes. */
 /* Data: CMS text records up to 1023 bytes; blank/tab default field split. */
-/* No assignments, arrays, functions or control-flow statements yet. */
+/* Scalar integer assignments and updates; next and exit. */
+/* No array variables, if/for/while, user functions or printf yet. */
 typedef struct cms_file FILE;
 extern FILE *fopen(const char *, const char *);
 extern char *fgets(char *, int, FILE *);
@@ -18,13 +19,26 @@ enum {
     MAX_STRING = 128,
     MAX_RECORD = 1024,
     MAX_FIELDS = 64,
+    MAX_VARS = 64,
     RULE_NORMAL = 0,
     RULE_BEGIN = 1,
     RULE_END = 2,
     ITEM_FIELD = 0,
     ITEM_NR = 1,
     ITEM_NF = 2,
-    ITEM_STRING = 3
+    ITEM_STRING = 3,
+    ITEM_VAR = 4,
+    ITEM_NUMBER = 5,
+    ACT_PRINT = 0,
+    ACT_SET = 1,
+    ACT_ADD = 2,
+    ACT_SUB = 3,
+    ACT_MUL = 4,
+    ACT_DIV = 5,
+    ACT_INC = 6,
+    ACT_DEC = 7,
+    ACT_NEXT = 8,
+    ACT_EXIT = 9
 };
 typedef struct {
     int kind;
@@ -36,9 +50,18 @@ typedef struct {
     int kind;
     int pattern_length;
     char pattern[MAX_PATTERN];
+    int action;
+    char variable[MAX_STRING];
+    AwkItem rhs;
     int item_count;
     AwkItem item[MAX_ITEMS];
 } AwkRule;
+typedef struct {
+    int used;
+    int initialized;
+    char name[MAX_STRING];
+    long value;
+} AwkVariable;
 typedef struct {
     int start;
     int length;
@@ -48,6 +71,10 @@ static int rule_count;
 static unsigned long nr;
 static int nf;
 static AwkField fields[MAX_FIELDS];
+static AwkVariable variables[MAX_VARS];
+static int variable_count;
+static int next_requested;
+static int exit_requested;
 static int text_length(const char *s) {
     int n = 0;
     while (s[n]) n++;
@@ -55,6 +82,11 @@ static int text_length(const char *s) {
 }
 static int is_space(char c) {
     return c == ' ' || c == '\t';
+}
+static int is_alpha(char c) {
+    return (c >= 'A' && c <= 'I') || (c >= 'J' && c <= 'R') ||
+           (c >= 'S' && c <= 'Z') || (c >= 'a' && c <= 'i') ||
+           (c >= 'j' && c <= 'r') || (c >= 's' && c <= 'z');
 }
 static char *skip_space(char *p) {
     while (is_space(*p)) p++;
@@ -79,6 +111,87 @@ static int number_text(unsigned long value, char *out) {
     for (i = 0; i < count; i++) out[i] = reversed[count - i - 1];
     out[count] = 0;
     return count;
+}
+static int signed_number_text(long value, char *out) {
+    unsigned long magnitude;
+    int n;
+    if (value < 0) {
+        out[0] = '-';
+        magnitude = (unsigned long)(-(value + 1)) + 1;
+        n = number_text(magnitude, out + 1);
+        return n + 1;
+    }
+    return number_text((unsigned long)value, out);
+}
+static int same_text(const char *a, const char *b) {
+    int i = 0;
+    while (a[i] && b[i] && a[i] == b[i]) i++;
+    return a[i] == 0 && b[i] == 0;
+}
+static void copy_name(char *to, const char *from, int limit) {
+    int i = 0;
+    while (from[i] && i < limit - 1) {
+        to[i] = from[i];
+        i++;
+    }
+    to[i] = 0;
+}
+static int variable_index(const char *name, int create) {
+    int i;
+    for (i = 0; i < variable_count; i++)
+        if (same_text(variables[i].name, name)) return i;
+    if (!create || variable_count >= MAX_VARS) return -1;
+    i = variable_count++;
+    variables[i].used = 1;
+    variables[i].initialized = 0;
+    copy_name(variables[i].name, name, MAX_STRING);
+    variables[i].value = 0;
+    return i;
+}
+static long integer_value(const char *text) {
+    long value = 0;
+    int sign = 1;
+    int i = 0;
+    while (is_space(text[i])) i++;
+    if (text[i] == '-') {
+        sign = -1;
+        i++;
+    } else if (text[i] == '+') {
+        i++;
+    }
+    while (text[i] >= '0' && text[i] <= '9') {
+        value = value * 10 + (text[i] - '0');
+        i++;
+    }
+    return sign * value;
+}
+static long item_number(const AwkItem *item, const char *record,
+                        unsigned long recno, int fields_count) {
+    char number[128];
+    int index;
+    int start = 0;
+    int length = 0;
+    int i;
+    if (item->kind == ITEM_NR) return (long)recno;
+    if (item->kind == ITEM_NF) return (long)fields_count;
+    if (item->kind == ITEM_VAR) {
+        index = variable_index(item->text, 1);
+        return index < 0 ? 0 : variables[index].value;
+    }
+    if (item->kind == ITEM_FIELD) {
+        if (item->field == 0) {
+            length = text_length(record);
+        } else if (item->field <= fields_count &&
+                   item->field <= MAX_FIELDS) {
+            start = fields[item->field - 1].start;
+            length = fields[item->field - 1].length;
+        }
+        if (length >= (int)sizeof number) length = (int)sizeof number - 1;
+        for (i = 0; i < length; i++) number[i] = record[start + i];
+        number[length] = 0;
+        return integer_value(number);
+    }
+    return integer_value(item->text);
 }
 static int parse_item(char **cursor, AwkItem *item) {
     char *p = skip_space(*cursor);
@@ -105,6 +218,16 @@ static int parse_item(char **cursor, AwkItem *item) {
         *cursor = p + 2;
         return 1;
     }
+    if (is_alpha(*p) || *p == '_') {
+        item->kind = ITEM_VAR;
+        while ((is_alpha(*p) || (*p >= '0' && *p <= '9') || *p == '_') &&
+               n < MAX_STRING - 1)
+            item->text[n++] = *p++;
+        item->text[n] = 0;
+        item->length = n;
+        *cursor = p;
+        return 1;
+    }
     item->kind = ITEM_STRING;
     if (*p == '"') {
         p++;
@@ -125,10 +248,11 @@ static int parse_item(char **cursor, AwkItem *item) {
     } else if ((*p >= '0' && *p <= '9') ||
                (*p == '-' && p[1] >= '0' && p[1] <= '9')) {
         while ((*p >= '0' && *p <= '9') || *p == '.' ||
-               (*p == '-' && n == 0)) {
+                (*p == '-' && n == 0)) {
             if (n >= MAX_STRING - 1) return 0;
             item->text[n++] = *p++;
         }
+        item->kind = ITEM_NUMBER;
     } else {
         return 0;
     }
@@ -136,6 +260,17 @@ static int parse_item(char **cursor, AwkItem *item) {
     item->length = n;
     *cursor = p;
     return 1;
+}
+static int parse_name(char **cursor, char *out, int limit) {
+    char *p = skip_space(*cursor);
+    int n = 0;
+    if (!is_alpha(*p) && *p != '_') return 0;
+    while ((is_alpha(*p) || (*p >= '0' && *p <= '9') || *p == '_') &&
+           n < limit - 1)
+        out[n++] = *p++;
+    out[n] = 0;
+    *cursor = p;
+    return n > 0;
 }
 static int parse_rule(char *line, AwkRule *rule) {
     char *p = skip_space(line);
@@ -146,6 +281,12 @@ static int parse_rule(char *line, AwkRule *rule) {
     rule->kind = RULE_NORMAL;
     rule->pattern_length = 0;
     rule->pattern[0] = 0;
+    rule->action = ACT_PRINT;
+    rule->variable[0] = 0;
+    rule->rhs.kind = ITEM_NUMBER;
+    rule->rhs.text[0] = '0';
+    rule->rhs.text[1] = 0;
+    rule->rhs.length = 1;
     rule->item_count = 0;
     for (i = 0; i < MAX_ITEMS; i++) {
         rule->item[i].kind = ITEM_FIELD;
@@ -182,27 +323,75 @@ static int parse_rule(char *line, AwkRule *rule) {
     }
     if (*p++ != '{') return -1;
     p = skip_space(p);
-    if (!starts_word(p, "print")) return -1;
-    p = skip_space(p + 5);
-    if (*p == '}') {
-        rule->item_count = 1;
-        rule->item[0].kind = ITEM_FIELD;
-        rule->item[0].field = 0;
+    if (starts_word(p, "print")) {
+        p = skip_space(p + 5);
+        if (*p == '}') {
+            rule->item_count = 1;
+            rule->item[0].kind = ITEM_FIELD;
+            rule->item[0].field = 0;
+            p++;
+        } else {
+            for (;;) {
+                if (rule->item_count >= MAX_ITEMS) return -1;
+                if (!parse_item(&p, &rule->item[rule->item_count])) return -1;
+                rule->item_count++;
+                p = skip_space(p);
+                if (*p == ',') {
+                    p = skip_space(p + 1);
+                    continue;
+                }
+                if (*p != '}') return -1;
+                p++;
+                break;
+            }
+        }
+    } else if (starts_word(p, "next")) {
+        rule->action = ACT_NEXT;
+        p = skip_space(p + 4);
+        if (*p != '}') return -1;
+        p++;
+    } else if (starts_word(p, "exit")) {
+        rule->action = ACT_EXIT;
+        p = skip_space(p + 4);
+        if (*p != '}') return -1;
         p++;
     } else {
-        for (;;) {
-            if (rule->item_count >= MAX_ITEMS) return -1;
-            if (!parse_item(&p, &rule->item[rule->item_count])) return -1;
-            rule->item_count++;
-            p = skip_space(p);
-            if (*p == ',') {
-                p = skip_space(p + 1);
-                continue;
-            }
-            if (*p != '}') return -1;
+        if (!parse_name(&p, rule->variable, MAX_STRING)) return -1;
+        p = skip_space(p);
+        if (p[0] == '+' && p[1] == '+') {
+            rule->action = ACT_INC;
+            p += 2;
+        } else if (p[0] == '-' && p[1] == '-') {
+            rule->action = ACT_DEC;
+            p += 2;
+        } else if (p[0] == '+' && p[1] == '=') {
+            rule->action = ACT_ADD;
+            p += 2;
+            if (!parse_item(&p, &rule->rhs)) return -1;
+        } else if (p[0] == '-' && p[1] == '=') {
+            rule->action = ACT_SUB;
+            p += 2;
+            if (!parse_item(&p, &rule->rhs)) return -1;
+        } else if (p[0] == '*' && p[1] == '=') {
+            rule->action = ACT_MUL;
+            p += 2;
+            if (!parse_item(&p, &rule->rhs)) return -1;
+        } else if (p[0] == '/' && p[1] == '=') {
+            rule->action = ACT_DIV;
+            p += 2;
+            if (!parse_item(&p, &rule->rhs)) return -1;
+        } else if (*p == '=') {
+            rule->action = ACT_SET;
             p++;
-            break;
+            if (!parse_item(&p, &rule->rhs)) return -1;
+        } else {
+            return -1;
         }
+        p = skip_space(p);
+        if (rule->action >= ACT_SET && rule->action <= ACT_DIV &&
+            rule->rhs.kind == ITEM_STRING) return -1;
+        if (*p != '}') return -1;
+        p++;
     }
     p = skip_space(p);
     if (*p && *p != '#') return -1;
@@ -333,6 +522,12 @@ static int print_rule(const AwkRule *rule, const char *record,
         } else if (item->kind == ITEM_NF) {
             length = number_text((unsigned long)fields_count, numbuf);
             text = numbuf;
+        } else if (item->kind == ITEM_VAR) {
+            int vi = variable_index(item->text, 1);
+            if (vi >= 0 && variables[vi].initialized) {
+                length = signed_number_text(variables[vi].value, numbuf);
+                text = numbuf;
+            }
         } else {
             text = item->text;
             length = item->length;
@@ -340,6 +535,40 @@ static int print_rule(const AwkRule *rule, const char *record,
         if (!append(out, &used, text, length)) return 0;
     }
     puts(out);
+    return 1;
+}
+static int run_rule(const AwkRule *rule, const char *record, int reclen,
+                    unsigned long recno, int fields_count) {
+    int vi;
+    long rhs;
+    if (rule->action == ACT_PRINT)
+        return print_rule(rule, record, reclen, recno, fields_count);
+    if (rule->action == ACT_NEXT) {
+        next_requested = 1;
+        return 1;
+    }
+    if (rule->action == ACT_EXIT) {
+        exit_requested = 1;
+        return 1;
+    }
+    vi = variable_index(rule->variable, 1);
+    if (vi < 0) return 0;
+    if (rule->action == ACT_INC) {
+        variables[vi].value++;
+    } else if (rule->action == ACT_DEC) {
+        variables[vi].value--;
+    } else {
+        rhs = item_number(&rule->rhs, record, recno, fields_count);
+        if (rule->action == ACT_SET) variables[vi].value = rhs;
+        else if (rule->action == ACT_ADD) variables[vi].value += rhs;
+        else if (rule->action == ACT_SUB) variables[vi].value -= rhs;
+        else if (rule->action == ACT_MUL) variables[vi].value *= rhs;
+        else if (rule->action == ACT_DIV) {
+            if (rhs == 0) return 0;
+            variables[vi].value /= rhs;
+        }
+    }
+    variables[vi].initialized = 1;
     return 1;
 }
 static void trim_record(char *line) {
@@ -362,7 +591,7 @@ int main(int argc, char **argv) {
     char script_id[32], data_id[32], line[MAX_RECORD];
     char last_record[MAX_RECORD];
     FILE *script, *data;
-    int i, last_nf = 0;
+    int i, last_nf = 0, run_data = 1, data_open = 0;
     if (argc != 7) {
         puts("Usage: CMSAWK scriptFN scriptFT scriptFM dataFN dataFT dataFM");
         return 4;
@@ -397,21 +626,33 @@ int main(int argc, char **argv) {
     fclose(script);
     nr = 0;
     nf = 0;
+    variable_count = 0;
+    next_requested = 0;
+    exit_requested = 0;
     last_record[0] = 0;
     for (i = 0; i < rule_count; i++) {
         if (rules[i].kind == RULE_BEGIN &&
-            !print_rule(&rules[i], "", 0, nr, nf)) return 8;
+            !run_rule(&rules[i], "", 0, nr, nf)) return 8;
+        if (exit_requested) {
+            run_data = 0;
+            break;
+        }
     }
-    data = fopen(data_id, "r");
-    if (!data) {
-        puts("CMSAWK: cannot open data file");
-        return 8;
+    data = 0;
+    if (run_data) {
+        data = fopen(data_id, "r");
+        if (!data) {
+            puts("CMSAWK: cannot open data file");
+            return 8;
+        }
+        data_open = 1;
     }
-    while (fgets(line, sizeof line, data)) {
+    while (run_data && !exit_requested && fgets(line, sizeof line, data)) {
         int length;
         trim_record(line);
         length = text_length(line);
         nr++;
+        next_requested = 0;
         split_record(line, length);
         last_nf = nf;
         if (length >= MAX_RECORD) {
@@ -427,19 +668,21 @@ int main(int argc, char **argv) {
             if (rules[i].kind == RULE_NORMAL &&
                 (!rules[i].pattern_length ||
                  regex_match(rules[i].pattern, line))) {
-                if (!print_rule(&rules[i], line, length, nr, nf)) {
-                    fclose(data);
-                    puts("CMSAWK: print output too long");
+                if (!run_rule(&rules[i], line, length, nr, nf)) {
+                    if (data_open) fclose(data);
+                    puts("CMSAWK: action failed");
                     return 8;
                 }
+                if (next_requested) break;
+                if (exit_requested) break;
             }
         }
     }
-    fclose(data);
+    if (data_open) fclose(data);
     for (i = 0; i < rule_count; i++) {
         if (rules[i].kind == RULE_END &&
-            !print_rule(&rules[i], last_record, text_length(last_record),
-                        nr, last_nf)) return 8;
+            !run_rule(&rules[i], last_record, text_length(last_record),
+                      nr, last_nf)) return 8;
     }
     return 0;
 }
