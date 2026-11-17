@@ -1,6 +1,6 @@
-/* CMSAWK 0.4: C89 AWK interpreter for GCCCMS/PDPCLIB. */
-/* Supports arrays, expressions, if/loops, functions, printf and sprintf. */
-/* One CMS source file; fixed tables bound source, variables and array sizes. */
+/* CMSAWK 0.5: C89 AWK interpreter for GCCCMS/PDPCLIB. */
+/* Adds getline, redirection, mutable fields and common POSIX built-ins. */
+/* ERE subset, fixed tables and strings bounded for CMS memory. */
 typedef struct cms_file FILE;
 extern FILE *fopen(const char *, const char *);
 extern char *fgets(char *, int, FILE *);
@@ -8,15 +8,21 @@ extern int fclose(FILE *);
 extern int puts(const char *);
 extern int printf(const char *, ...);
 extern int sprintf(char *, const char *, ...);
+extern int fputs(const char *, FILE *);
+extern int fflush(FILE *);
+extern int fseek(FILE *, long, int);
+extern int system(const char *);
 enum {
     SOURCE_SIZE = 16384, MAX_RULES = 64, MAX_FUNCS = 24,
     MAX_VARS = 64, MAX_ARRAYS = 32, MAX_ITEMS = 64,
     MAX_STRING = 128, MAX_KEY = 64, MAX_RECORD = 1024,
-    MAX_FIELDS = 64, MAX_PARAMS = 16, MAX_FRAMES = 12,
+    MAX_FIELDS = 64, MAX_PARAMS = 16, MAX_FRAMES = 12, MAX_IO = 8,
+    MAX_APPEND_COPY = 65536,
     TOK_ID = 256, TOK_NUM, TOK_STR, TOK_REGEX, TOK_SEMI,
     TOK_EQ, TOK_NE, TOK_LE, TOK_GE, TOK_AND, TOK_OR,
     TOK_INC, TOK_DEC, TOK_ADD_EQ, TOK_SUB_EQ, TOK_MUL_EQ,
     TOK_DIV_EQ, TOK_MOD_EQ, TOK_MATCH, TOK_NMATCH, TOK_APPEND, TOK_IN,
+    CMS_SEEK_END = 2,
     V_EMPTY = 0, V_NUM, V_STR, V_ARRAY,
     RULE_ALL = 0, RULE_REGEX = 1, RULE_EXPR = 2,
     RULE_BEGIN = 3, RULE_END = 4,
@@ -100,14 +106,27 @@ static CallFrame frames[MAX_FRAMES];
 static int frame_depth;
 static int flow_state;
 static unsigned long nr;
+static unsigned long fnr;
 static int nf;
 static int field_start[MAX_FIELDS];
 static int field_length[MAX_FIELDS];
+static char field_text[MAX_FIELDS][MAX_STRING];
 static char record[MAX_RECORD];
 static int record_length;
 static int error_flag;
 static int execute_enabled = 1;
+static int print_context;
+static int regex_icase;
+static unsigned long random_seed = 1UL;
+static FILE *data_stream;
+static FILE *io_stream[MAX_IO];
+static char io_name[MAX_IO][MAX_STRING];
+static char io_mode[MAX_IO];
+static char append_copy[MAX_APPEND_COPY];
 static void format_output(const char *, Value *, int, char *, int);
+static int assign_field(int, Value);
+static int assign_nf(Value);
+static void split_fields(void);
 static int slen(const char *s) {
     int n = 0;
     while (s[n]) n++;
@@ -125,6 +144,87 @@ static int seq(const char *a, const char *b) {
     int i = 0;
     while (a[i] && b[i] && a[i] == b[i]) i++;
     return a[i] == 0 && b[i] == 0;
+}
+static FILE *open_append_copy(const char *);
+static FILE *open_io(const char *name, char mode) {
+    int i, free_slot = -1;
+    const char *access = mode == 'r' ? "r" : mode == 'a' ? "a" : "w";
+    for (i = 0; i < MAX_IO; i++) {
+        if (!io_stream[i]) {
+            if (free_slot < 0) free_slot = i;
+            continue;
+        }
+        if (seq(io_name[i], name)) return io_stream[i];
+    }
+    if (free_slot < 0) {
+        error_flag = 1;
+        return 0;
+    }
+    io_stream[free_slot] = mode == 'a' ? fopen(name, "a") :
+                                          fopen(name, access);
+    if (!io_stream[free_slot] && mode == 'a') {
+        FILE *probe = fopen(name, "r+");
+        if (probe) {
+            if (fseek(probe, 0L, CMS_SEEK_END) == 0)
+                io_stream[free_slot] = probe;
+            else fclose(probe);
+        }
+        if (!io_stream[free_slot])
+            io_stream[free_slot] = open_append_copy(name);
+    }
+    if (!io_stream[free_slot]) return 0;
+    scopy(io_name[free_slot], name, MAX_STRING);
+    io_mode[free_slot] = mode;
+    return io_stream[free_slot];
+}
+static int close_io(const char *name) {
+    int i, found = 0, rc = 0;
+    for (i = 0; i < MAX_IO; i++) {
+        if (io_stream[i] && seq(io_name[i], name)) {
+            fflush(io_stream[i]);
+            if (fclose(io_stream[i]) != 0) rc = -1;
+            io_stream[i] = 0;
+            io_name[i][0] = 0;
+            io_mode[i] = 0;
+            found = 1;
+        }
+    }
+    return found ? rc : -1;
+}
+static void close_all_io(void) {
+    int i;
+    for (i = 0; i < MAX_IO; i++) {
+        if (io_stream[i]) {
+            fflush(io_stream[i]);
+            fclose(io_stream[i]);
+            io_stream[i] = 0;
+        }
+    }
+}
+static FILE *open_append_copy(const char *name) {
+    FILE *input, *output;
+    char line[MAX_RECORD];
+    int used = 0, i, n;
+    input = fopen(name, "r");
+    if (!input) return fopen(name, "w");
+    while (fgets(line, sizeof line, input)) {
+        n = slen(line);
+        if (used + n >= MAX_APPEND_COPY) {
+            fclose(input);
+            error_flag = 1;
+            return 0;
+        }
+        for (i = 0; i < n; i++) append_copy[used++] = line[i];
+    }
+    if (fclose(input) != 0) return 0;
+    append_copy[used] = 0;
+    output = fopen(name, "w");
+    if (!output) return 0;
+    if (used && fputs(append_copy, output) < 0) {
+        fclose(output);
+        return 0;
+    }
+    return output;
 }
 static int is_space(char c) {
     return c == ' ' || c == '\t' || c == '\r';
@@ -522,6 +622,19 @@ static Value get_variable(const char *name) {
     if (var->array_id >= 0) v.kind = V_ARRAY;
     return v;
 }
+static void current_subsep(char *out) {
+    AwkVar *var;
+    int scope, index;
+    char def[2];
+    var = resolve_var("SUBSEP", 0, &scope, &index);
+    if (var && var->value.kind != V_EMPTY) {
+        as_string(var->value, out);
+        return;
+    }
+    def[0] = '\034';
+    def[1] = 0;
+    scopy(out, def, MAX_STRING);
+}
 static Value get_element(const char *name, const char *key, int create) {
     Value v = empty_value();
     AwkVar *var;
@@ -541,44 +654,166 @@ static void assign_ref(Value ref, Value value) {
     AwkVar *var;
     if (ref.ref_kind == 1) {
         var = ref_var(ref.ref_entry, ref.ref_index);
-        if (var) var->value = value;
+        if (var) {
+            var->value = value;
+            if (ref.ref_entry == 0 && seq(var->name, "FS"))
+                split_fields();
+        }
+    } else if (ref.ref_kind == 3) {
+        assign_field(ref.ref_index, value);
+    } else if (ref.ref_kind == 4) {
+        assign_nf(value);
+    } else if (ref.ref_kind == 5) {
+        nr = (unsigned long)as_number(value);
+    } else if (ref.ref_kind == 6) {
+        fnr = (unsigned long)as_number(value);
     } else if (ref.ref_kind == 2 && ref.ref_index >= 0 &&
                ref.ref_index < array_count && ref.ref_entry >= 0 &&
                ref.ref_entry < arrays[ref.ref_index].count) {
         arrays[ref.ref_index].item[ref.ref_entry].value = value;
     } else error_flag = 1;
 }
+static int regex_span(const char *, const char *, int *, int *);
 static void split_fields(void) {
-    int i = 0;
+    int i = 0, fs_index = find_global("FS", 0), fs_len;
+    char fs[MAX_STRING];
     nf = 0;
-    while (i < record_length) {
-        int start;
-        while (i < record_length &&
-               (record[i] == ' ' || record[i] == '\t')) i++;
-        if (i >= record_length) break;
-        start = i;
-        while (i < record_length &&
-               record[i] != ' ' && record[i] != '\t') i++;
-        if (nf < MAX_FIELDS) {
-            field_start[nf] = start;
-            field_length[nf] = i - start;
+    if (fs_index >= 0 && globals[fs_index].value.kind != V_EMPTY)
+        as_string(globals[fs_index].value, fs);
+    else scopy(fs, " ", MAX_STRING);
+    fs_len = slen(fs);
+    if (fs_len == 1 && fs[0] == ' ') {
+        while (i < record_length) {
+            int start;
+            while (i < record_length &&
+                   (record[i] == ' ' || record[i] == '\t')) i++;
+            if (i >= record_length) break;
+            start = i;
+            while (i < record_length &&
+                   record[i] != ' ' && record[i] != '\t') i++;
+            if (nf < MAX_FIELDS) {
+                field_start[nf] = start;
+                field_length[nf] = i - start;
+            }
+            nf++;
         }
-        nf++;
+    } else if (fs_len == 0) {
+        for (i = 0; i < record_length && nf < MAX_FIELDS; i++) {
+            field_start[nf] = i;
+            field_length[nf++] = 1;
+        }
+    } else if (fs_len == 1) {
+        int start = 0;
+        for (i = 0; i <= record_length && nf < MAX_FIELDS; i++) {
+            if (i == record_length || record[i] == fs[0]) {
+                field_start[nf] = start;
+                field_length[nf++] = i - start;
+                start = i + 1;
+            }
+        }
+    } else {
+        int start = 0, off, length;
+        while (start <= record_length && nf < MAX_FIELDS) {
+            if (!regex_span(fs, record + start, &off, &length)) {
+                field_start[nf] = start;
+                field_length[nf++] = record_length - start;
+                break;
+            }
+            field_start[nf] = start;
+            field_length[nf++] = off;
+            start += off + length;
+            if (length == 0 && start < record_length) start++;
+        }
     }
-    if (nf > MAX_FIELDS) nf = MAX_FIELDS;
 }
 static Value field_value(int n) {
     char text[MAX_STRING];
     int i, len;
-    if (n == 0) return string_value(record);
-    if (n < 1 || n > nf || n > MAX_FIELDS) return empty_value();
-    len = field_length[n - 1];
-    if (len >= MAX_STRING) len = MAX_STRING - 1;
-    for (i = 0; i < len; i++) text[i] = record[field_start[n - 1] + i];
-    text[len] = 0;
-    return string_value(text);
+    Value v;
+    if (n == 0) v = string_value(record);
+    else if (n < 1 || n > nf || n > MAX_FIELDS) v = empty_value();
+    else {
+        len = field_length[n - 1];
+        if (len >= MAX_STRING) len = MAX_STRING - 1;
+        for (i = 0; i < len; i++)
+            text[i] = record[field_start[n - 1] + i];
+        text[len] = 0;
+        v = string_value(text);
+    }
+    v.ref_kind = 3;
+    v.ref_index = n;
+    return v;
 }
-static int regex_here(const char *p, const char *s);
+static void save_fields(void) {
+    int i, j, len;
+    for (i = 0; i < MAX_FIELDS; i++) field_text[i][0] = 0;
+    for (i = 0; i < nf && i < MAX_FIELDS; i++) {
+        len = field_length[i];
+        if (len >= MAX_STRING) len = MAX_STRING - 1;
+        for (j = 0; j < len; j++)
+            field_text[i][j] = record[field_start[i] + j];
+        field_text[i][len] = 0;
+    }
+}
+static void rebuild_record(int count) {
+    char rebuilt[MAX_RECORD], ofs[MAX_STRING];
+    int oi = find_global("OFS", 0);
+    int used = 0, i, j, olen;
+    if (oi >= 0 && globals[oi].value.kind != V_EMPTY)
+        as_string(globals[oi].value, ofs);
+    else scopy(ofs, " ", MAX_STRING);
+    olen = slen(ofs);
+    rebuilt[0] = 0;
+    for (i = 0; i < count; i++) {
+        if (i && used + olen < MAX_RECORD - 1) {
+            for (j = 0; j < olen; j++) rebuilt[used++] = ofs[j];
+        }
+        field_start[i] = used;
+        for (j = 0; field_text[i][j] && used < MAX_RECORD - 1; j++)
+            rebuilt[used++] = field_text[i][j];
+        field_length[i] = used - field_start[i];
+    }
+    rebuilt[used] = 0;
+    scopy(record, rebuilt, MAX_RECORD);
+    record_length = used;
+    nf = count;
+}
+static int assign_field(int n, Value value) {
+    char text[MAX_STRING];
+    int count;
+    if (n < 0 || n > MAX_FIELDS) {
+        error_flag = 1;
+        return 0;
+    }
+    as_string(value, text);
+    if (n == 0) {
+        scopy(record, text, MAX_RECORD);
+        record_length = slen(record);
+        split_fields();
+        return 1;
+    }
+    save_fields();
+    count = nf > n ? nf : n;
+    scopy(field_text[n - 1], text, MAX_STRING);
+    rebuild_record(count);
+    return 1;
+}
+static int assign_nf(Value value) {
+    int count = (int)as_number(value);
+    if (count < 0 || count > MAX_FIELDS) {
+        error_flag = 1;
+        return 0;
+    }
+    save_fields();
+    rebuild_record(count);
+    return 1;
+}
+static int case_lower(char);
+static int case_upper(char);
+static int regex_class(const char *, int, char);
+static int regex_equal(char a, char b) {
+    return a == b || (regex_icase && case_lower(a) == case_lower(b));
+}
 static int regex_atom(const char **p, char c) {
     const char *q = *p;
     int neg = 0, hit = 0;
@@ -588,20 +823,48 @@ static int regex_atom(const char **p, char c) {
     }
     if (*q == '\\' && q[1]) {
         *p = q + 2;
-        return q[1] == c;
+        if (q[1] == 'd' || q[1] == 'D') {
+            hit = is_digit(c);
+            return q[1] == 'd' ? hit : !hit;
+        }
+        if (q[1] == 'w' || q[1] == 'W') {
+            hit = is_alpha(c) || is_digit(c) || c == '_';
+            return q[1] == 'w' ? hit : !hit;
+        }
+        if (q[1] == 's' || q[1] == 'S') {
+            hit = is_space(c) || c == '\n';
+            return q[1] == 's' ? hit : !hit;
+        }
+        return regex_equal(q[1], c);
     }
     if (*q != '[') {
         if (*q) *p = q + 1;
-        return *q == c;
+        return regex_equal(*q, c);
     }
     q++;
     if (*q == '^') { neg = 1; q++; }
     while (*q && *q != ']') {
-        if (q[1] == '-' && q[2] && q[2] != ']') {
-            if (c >= q[0] && c <= q[2]) hit = 1;
+        if (q[0] == '[' && q[1] == ':') {
+            const char *end = q + 2;
+            while (*end && !(end[0] == ':' && end[1] == ']')) end++;
+            if (end[0] == ':' && end[1] == ']') {
+                if (regex_class(q + 2, (int)(end - (q + 2)), c))
+                    hit = 1;
+                q = end + 2;
+            } else {
+                if (c == *q) hit = 1;
+                q++;
+            }
+        } else if (q[1] == '-' && q[2] && q[2] != ']') {
+            char test = regex_icase ? case_lower(c) : c;
+            char low = regex_icase ? case_lower(q[0]) : q[0];
+            char high = regex_icase ? case_lower(q[2]) : q[2];
+            if (q[0] == 'A' && q[2] == 'Z' && regex_icase) {
+                if (is_alpha(c)) hit = 1;
+            } else if (test >= low && test <= high) hit = 1;
             q += 3;
         } else {
-            if (c == *q) hit = 1;
+            if (regex_equal(c, *q)) hit = 1;
             q++;
         }
     }
@@ -609,37 +872,232 @@ static int regex_atom(const char **p, char c) {
     *p = q;
     return neg ? !hit : hit;
 }
-static int regex_star(const char *atom, const char *rest, const char *s) {
-    const char *p;
-    if (regex_here(rest, s)) return 1;
-    while (*s) {
-        p = atom;
-        if (!regex_atom(&p, *s)) break;
-        s++;
-        if (regex_here(rest, s)) return 1;
+static int regex_here_end(const char *p, const char *s,
+                          const char **match_end);
+static int regex_repeat_range(const char *atom, const char *rest,
+                              const char *s, int count, int minimum,
+                              int maximum, const char **match_end) {
+    const char *next;
+    if (count < maximum && *s) {
+        next = atom;
+        if (regex_atom(&next, *s) &&
+            regex_repeat_range(atom, rest, s + 1, count + 1,
+                               minimum, maximum, match_end)) return 1;
     }
+    if (count >= minimum)
+        return regex_here_end(rest, s, match_end);
     return 0;
 }
-static int regex_here(const char *p, const char *s) {
+static int regex_repeat(const char *atom, const char *rest,
+                        const char *s, const char **match_end) {
+    const char *next;
+    if (*s) {
+        next = atom;
+        if (regex_atom(&next, *s) &&
+            regex_repeat(atom, rest, s + 1, match_end)) return 1;
+    }
+    return regex_here_end(rest, s, match_end);
+}
+static int regex_class(const char *name, int length, char c) {
+    int lower = case_lower(c), upper = case_upper(c);
+    if (length == 5 && name[0] == 'd' && name[1] == 'i')
+        return is_digit(c);
+    if (length == 5 && name[0] == 'a' && name[1] == 'l' &&
+        name[2] == 'p') return is_alpha(c);
+    if (length == 5 && name[0] == 'a' && name[1] == 'l' &&
+        name[2] == 'n') return is_alpha(c) || is_digit(c);
+    if (length == 4 && name[0] == 'w')
+        return is_alpha(c) || is_digit(c) || c == '_';
+    if (length == 5 && name[0] == 's' && name[1] == 'p')
+        return is_space(c) || c == '\n';
+    if (length == 5 && name[0] == 'b' && name[1] == 'l')
+        return c == ' ' || c == '\t';
+    if (length == 5 && name[0] == 'l' && name[1] == 'o')
+        return (lower == c || regex_icase) && is_alpha(c);
+    if (length == 5 && name[0] == 'u' && name[1] == 'p')
+        return (upper == c || regex_icase) && is_alpha(c);
+    if (length == 6 && name[0] == 'x' && name[1] == 'd')
+        return is_digit(c) || (lower >= 'a' && lower <= 'f');
+    return 0;
+}
+static int regex_here_end(const char *p, const char *s,
+                          const char **match_end) {
     const char *q = p;
-    int hit;
-    if (!*p) return 1;
-    if (*p == '$' && !p[1]) return !*s;
+    int hit, minimum, maximum, digits;
+    if (!*p) {
+        *match_end = s;
+        return 1;
+    }
+    if (*p == '$' && !p[1]) {
+        if (*s) return 0;
+        *match_end = s;
+        return 1;
+    }
     hit = regex_atom(&q, *s);
-    if (*q == '*') return regex_star(p, q + 1, s);
-    if (*q == '+') return hit && regex_star(p, q + 1, s + 1);
+    if (*q == '*') return regex_repeat(p, q + 1, s, match_end);
+    if (*q == '+')
+        return hit && regex_repeat(p, q + 1, s + 1, match_end);
     if (*q == '?') {
         q++;
-        return (hit && regex_here(q, s + 1)) || regex_here(q, s);
+        if (hit && regex_here_end(q, s + 1, match_end)) return 1;
+        return regex_here_end(q, s, match_end);
     }
-    return hit && regex_here(q, s + 1);
+    if (*q == '{') {
+        const char *r = q + 1;
+        minimum = 0;
+        maximum = 0;
+        digits = 0;
+        while (is_digit(*r)) {
+            digits = 1;
+            minimum = minimum * 10 + (*r++ - '0');
+        }
+        maximum = minimum;
+        if (*r == ',') {
+            r++;
+            if (!is_digit(*r)) maximum = MAX_RECORD;
+            else {
+                maximum = 0;
+                while (is_digit(*r))
+                    maximum = maximum * 10 + (*r++ - '0');
+            }
+        } else if (!digits) r = q;
+        if (*r == '}' && digits && maximum >= minimum) {
+            return regex_repeat_range(p, r + 1, s, 0, minimum,
+                                      maximum, match_end);
+        }
+    }
+    return hit && regex_here_end(q, s + 1, match_end);
+}
+static int regex_span_one(const char *p, const char *s,
+                          int *start, int *length) {
+    const char *at = s, *end;
+    int offset = 0;
+    if (*p == '^') {
+        if (!regex_here_end(p + 1, s, &end)) return 0;
+        *start = 0;
+        *length = (int)(end - s);
+        return 1;
+    }
+    for (;;) {
+        if (regex_here_end(p, at, &end)) {
+            *start = offset;
+            *length = (int)(end - at);
+            return 1;
+        }
+        if (!*at) return 0;
+        at++;
+        offset++;
+    }
+}
+static int regex_append(char *to, int used, int cap, const char *from) {
+    int i = 0;
+    while (from[i] && used + i < cap - 1) {
+        to[used + i] = from[i];
+        i++;
+    }
+    to[used + i] = 0;
+    return used + i;
+}
+static void regex_expand(const char *p, char out[][MAX_STRING],
+                         int *count, int depth) {
+    int i, open = -1, close = -1, level = 0, escaped = 0, in_class = 0;
+    int begin, j;
+    char candidate[MAX_STRING];
+    if (*count >= 32 || depth >= 12) return;
+    for (i = 0; p[i]; i++) {
+        if (escaped) { escaped = 0; continue; }
+        if (p[i] == '\\') { escaped = 1; continue; }
+        if (p[i] == '[') { in_class = 1; continue; }
+        if (p[i] == ']' && in_class) { in_class = 0; continue; }
+        if (in_class) continue;
+        if (p[i] == '(') {
+            if (open < 0) open = i;
+            level++;
+        } else if (p[i] == ')') {
+            if (level > 0 && --level == 0) { close = i; break; }
+        }
+    }
+    if (open >= 0 && close > open && p[close + 1] != '*' &&
+        p[close + 1] != '+' && p[close + 1] != '?' &&
+        p[close + 1] != '{') {
+        escaped = 0;
+        in_class = 0;
+        level = 0;
+        begin = open + 1;
+        for (i = begin; i <= close; i++) {
+            char c = p[i];
+            if (i == close || (!escaped && !in_class && level == 0 &&
+                               c == '|')) {
+                int used = 0;
+                candidate[0] = 0;
+                used = regex_append(candidate, used, MAX_STRING, p);
+                candidate[open] = 0;
+                used = open;
+                for (j = begin; j < i && used < MAX_STRING - 1; j++)
+                    candidate[used++] = p[j];
+                for (j = close + 1; p[j] && used < MAX_STRING - 1; j++)
+                    candidate[used++] = p[j];
+                candidate[used] = 0;
+                regex_expand(candidate, out, count, depth + 1);
+                begin = i + 1;
+                escaped = 0;
+                continue;
+            }
+            if (escaped) escaped = 0;
+            else if (c == '\\') escaped = 1;
+            else if (c == '[') in_class = 1;
+            else if (c == ']' && in_class) in_class = 0;
+            else if (!in_class && c == '(') level++;
+            else if (!in_class && c == ')' && level > 0) level--;
+        }
+        return;
+    }
+    escaped = 0;
+    in_class = 0;
+    for (i = 0; p[i]; i++) {
+        char c = p[i];
+        if (escaped) { escaped = 0; continue; }
+        if (c == '\\') { escaped = 1; continue; }
+        if (c == '[') { in_class = 1; continue; }
+        if (c == ']' && in_class) { in_class = 0; continue; }
+        if (!in_class && c == '|') {
+            int len = i;
+            if (len >= MAX_STRING) len = MAX_STRING - 1;
+            for (j = 0; j < len; j++) out[*count][j] = p[j];
+            out[*count][len] = 0;
+            (*count)++;
+            regex_expand(p + i + 1, out, count, depth + 1);
+            return;
+        }
+    }
+    scopy(out[*count], p, MAX_STRING);
+    (*count)++;
+}
+static int regex_span(const char *p, const char *s,
+                      int *start, int *length) {
+    char alternatives[32][MAX_STRING];
+    int count = 0, i, found = 0, at, len, best_at = 0, best_len = 0;
+    int old_icase = regex_icase, ign = find_global("IGNORECASE", 0);
+    regex_icase = ign >= 0 && truth(globals[ign].value);
+    regex_expand(p, alternatives, &count, 0);
+    for (i = 0; i < count; i++) {
+        if (regex_span_one(alternatives[i], s, &at, &len) &&
+            (!found || at < best_at || (at == best_at && len > best_len))) {
+            found = 1;
+            best_at = at;
+            best_len = len;
+        }
+    }
+    if (found) {
+        *start = best_at;
+        *length = best_len;
+    }
+    regex_icase = old_icase;
+    return found;
 }
 static int regex_match(const char *p, const char *s) {
-    if (*p == '^') return regex_here(p + 1, s);
-    do {
-        if (regex_here(p, s)) return 1;
-    } while (*s++);
-    return 0;
+    int start, length;
+    return regex_span(p, s, &start, &length);
 }
 static int prec_start(int k) {
     return k == TOK_ID || k == TOK_NUM || k == TOK_STR || k == '$' ||
@@ -648,6 +1106,24 @@ static int prec_start(int k) {
 static Value parse_expression(void);
 static Value parse_assignment(void);
 static Value parse_statement(int run);
+static int read_record(FILE *stream, int count_nr, int replace_zero,
+                       int has_target, Value target) {
+    char line[MAX_RECORD];
+    int n;
+    if (!stream || !fgets(line, sizeof line, stream)) return 0;
+    n = slen(line);
+    while (n > 0 && (line[n - 1] == '\n' || line[n - 1] == '\r'))
+        line[--n] = 0;
+    if (count_nr) { nr++; fnr++; }
+    if (replace_zero) {
+        scopy(record, line, MAX_RECORD);
+        record_length = slen(record);
+        split_fields();
+    } else if (has_target) {
+        assign_ref(target, string_value(line));
+    }
+    return 1;
+}
 static int find_function(const char *name) {
     int i;
     for (i = 0; i < function_count; i++)
@@ -700,9 +1176,304 @@ static Value call_function(int fi, Value *args, int argc) {
     restore_parser(resume);
     return result;
 }
+static void clear_array(int aid) {
+    int i;
+    if (aid < 0 || aid >= array_count) return;
+    for (i = 0; i < arrays[aid].count; i++)
+        arrays[aid].item[i].used = 0;
+    arrays[aid].count = 0;
+}
+static int array_from_value(Value v) {
+    AwkVar *var;
+    if (v.kind == V_ARRAY) return v.array_id;
+    if (v.ref_kind != 1) return -1;
+    var = ref_var(v.ref_entry, v.ref_index);
+    return var ? ensure_array(var) : -1;
+}
+static void set_global(const char *name, Value v) {
+    int i = find_global(name, 1);
+    if (i >= 0) globals[i].value = v;
+}
+static int split_into_array(const char *text, int aid, const char *sep) {
+    int count = 0, i = 0, start, len, n;
+    char key[MAX_KEY], part[MAX_STRING];
+    int sep_len = slen(sep);
+    clear_array(aid);
+    n = slen(text);
+    if (sep_len == 1 && sep[0] == ' ') {
+        while (i < n) {
+            while (i < n && is_space(text[i])) i++;
+            if (i >= n) break;
+            start = i;
+            while (i < n && !is_space(text[i])) i++;
+            len = i - start;
+            if (len >= MAX_STRING) len = MAX_STRING - 1;
+            while (len > 0) {
+                int j;
+                for (j = 0; j < len; j++) part[j] = text[start + j];
+                part[len] = 0;
+                sprintf(key, "%d", count + 1);
+                if (array_item(aid, key, 1) < 0) return count;
+                arrays[aid].item[array_item(aid, key, 0)].value =
+                    string_value(part);
+                count++;
+                break;
+            }
+        }
+        return count;
+    }
+    if (!sep_len) {
+        while (i < n && count < MAX_ITEMS) {
+            part[0] = text[i++];
+            part[1] = 0;
+            sprintf(key, "%d", count + 1);
+            {
+                int entry = array_item(aid, key, 1);
+                if (entry < 0) break;
+                arrays[aid].item[entry].value = string_value(part);
+            }
+            count++;
+        }
+        return count;
+    }
+    while (i <= n) {
+        int at, width, found = 0;
+        if (i == n) {
+            at = n;
+            width = 0;
+            found = 1;
+        } else if (sep_len == 1) {
+            for (at = i; at < n && text[at] != sep[0]; at++) {}
+            if (at < n) { width = 1; found = 1; }
+        } else {
+            int off, ml;
+            if (regex_span(sep, text + i, &off, &ml)) {
+                at = i + off;
+                width = ml;
+                found = 1;
+            }
+        }
+        if (!found) {
+            at = n;
+            width = 0;
+        }
+        len = at - i;
+        if (len >= MAX_STRING) len = MAX_STRING - 1;
+        {
+            int j;
+            for (j = 0; j < len; j++) part[j] = text[i + j];
+        }
+        part[len] = 0;
+        sprintf(key, "%d", count + 1);
+        {
+            int entry = array_item(aid, key, 1);
+            if (entry < 0) return count;
+            arrays[aid].item[entry].value = string_value(part);
+        }
+        count++;
+        if (at >= n) break;
+        i = at + width;
+        if (width == 0 && i < n) i++;
+    }
+    return count;
+}
+static int case_lower(char c) {
+    if ((c >= 'A' && c <= 'I') || (c >= 'J' && c <= 'R') ||
+        (c >= 'S' && c <= 'Z')) return c + ('a' - 'A');
+    return c;
+}
+static int case_upper(char c) {
+    if ((c >= 'a' && c <= 'i') || (c >= 'j' && c <= 'r') ||
+        (c >= 's' && c <= 'z')) return c + ('A' - 'a');
+    return c;
+}
+static double abs_double(double x) {
+    return x < 0 ? -x : x;
+}
+static double sqrt_approx(double x) {
+    double guess;
+    int i;
+    if (x < 0) { error_flag = 1; return 0; }
+    if (x == 0) return 0;
+    guess = x >= 1 ? x : 1;
+    for (i = 0; i < 32; i++) guess = (guess + x / guess) / 2;
+    return guess;
+}
+static double exp_approx(double x) {
+    double term = 1, sum = 1;
+    int i, scale = 0;
+    if (x > 80) return 1.0e30;
+    if (x < -80) return 0;
+    while (abs_double(x) > 0.5 && scale < 16) {
+        x /= 2;
+        scale++;
+    }
+    for (i = 1; i <= 36; i++) {
+        term *= x / i;
+        sum += term;
+    }
+    while (scale-- > 0) sum *= sum;
+    return sum;
+}
+static double log_approx(double x) {
+    double z, z2, term, sum;
+    int scale = 0, i;
+    if (x <= 0) { error_flag = 1; return 0; }
+    while (x > 1.5) { x /= 2; scale++; }
+    while (x < 0.75) { x *= 2; scale--; }
+    z = (x - 1) / (x + 1);
+    z2 = z * z;
+    term = z;
+    sum = z;
+    for (i = 3; i <= 79; i += 2) {
+        term *= z2;
+        sum += term / i;
+    }
+    return 2 * sum + scale * 0.6931471805599453;
+}
+static double atan_small(double x) {
+    double term = x, sum = x, x2 = x * x;
+    int i, sign = -1;
+    for (i = 3; i <= 79; i += 2) {
+        term *= x2;
+        sum += sign * term / i;
+        sign = -sign;
+    }
+    return sum;
+}
+static double atan_approx(double x) {
+    double sign = 1;
+    if (x < 0) { sign = -1; x = -x; }
+    if (x > 1) return sign * (1.5707963267948966 -
+                              atan_approx(1 / x));
+    if (x > 0.4142135623730950)
+        return sign * (0.7853981633974483 +
+                       atan_small((x - 1) / (x + 1)));
+    return sign * atan_small(x);
+}
+static double atan2_approx(double y, double x) {
+    if (x > 0) return atan_approx(y / x);
+    if (x < 0 && y >= 0) return atan_approx(y / x) + 3.1415926535897932;
+    if (x < 0 && y < 0) return atan_approx(y / x) - 3.1415926535897932;
+    if (y > 0) return 1.5707963267948966;
+    if (y < 0) return -1.5707963267948966;
+    return 0;
+}
+static double sin_approx(double x) {
+    double term, sum, x2;
+    int i, n;
+    while (x > 3.1415926535897932) x -= 6.2831853071795864;
+    while (x < -3.1415926535897932) x += 6.2831853071795864;
+    term = x;
+    sum = x;
+    x2 = x * x;
+    for (i = 3, n = 1; i <= 31; i += 2, n++) {
+        term *= -x2 / ((i - 1) * i);
+        sum += term;
+    }
+    return sum;
+}
+static int substitute_value(const char *pattern, const char *replacement,
+                            Value target, int global, int use_current) {
+    char input[MAX_STRING], repl[MAX_STRING], output[MAX_STRING];
+    int in_len, pos = 0, used = 0, count = 0;
+    as_string(target, input);
+    as_string(string_value(replacement), repl);
+    in_len = slen(input);
+    output[0] = 0;
+    while (pos <= in_len && used < MAX_STRING - 1) {
+        int start, length, i;
+        if (!regex_span(pattern, input + pos, &start, &length)) break;
+        start += pos;
+        for (i = pos; i < start && used < MAX_STRING - 1; i++)
+            output[used++] = input[i];
+        for (i = 0; repl[i] && used < MAX_STRING - 1; i++) {
+            if (repl[i] == '&') {
+                int j;
+                for (j = 0; j < length && used < MAX_STRING - 1; j++)
+                    output[used++] = input[start + j];
+            } else if (repl[i] == '\\' && repl[i + 1] == '&') {
+                output[used++] = '&';
+                i++;
+            } else output[used++] = repl[i];
+        }
+        count++;
+        pos = start + length;
+        if (!global) break;
+        if (length == 0 && pos < in_len) output[used++] = input[pos++];
+        if (length == 0 && pos >= in_len) break;
+    }
+    while (pos < in_len && used < MAX_STRING - 1)
+        output[used++] = input[pos++];
+    output[used] = 0;
+    if (count) {
+        if (target.ref_kind) assign_ref(target, string_value(output));
+        else if (use_current) assign_field(0, string_value(output));
+    }
+    return count;
+}
+static void set_array_string(int aid, int index, const char *text) {
+    char key[MAX_KEY];
+    int entry;
+    sprintf(key, "%d", index);
+    entry = array_item(aid, key, 1);
+    if (entry >= 0) arrays[aid].item[entry].value = string_value(text);
+}
+static void match_captures(const char *pattern, const char *matched,
+                           int aid) {
+    int i = 0, group = 0, cursor = 0, escaped = 0, in_class = 0;
+    char value[MAX_STRING], body[MAX_STRING];
+    int matched_len = slen(matched);
+    clear_array(aid);
+    set_array_string(aid, 0, matched);
+    while (pattern[i]) {
+        int open, close, depth, j, start, length, nested;
+        if (escaped) { escaped = 0; i++; continue; }
+        if (pattern[i] == '\\') { escaped = 1; i++; continue; }
+        if (pattern[i] == '[') { in_class = 1; i++; continue; }
+        if (pattern[i] == ']' && in_class) { in_class = 0; i++; continue; }
+        if (in_class || pattern[i] != '(') { i++; continue; }
+        open = i++;
+        close = -1;
+        depth = 1;
+        nested = 0;
+        escaped = 0;
+        in_class = 0;
+        while (pattern[i] && depth) {
+            if (escaped) { escaped = 0; i++; continue; }
+            if (pattern[i] == '\\') { escaped = 1; i++; continue; }
+            if (pattern[i] == '[') { in_class = 1; i++; continue; }
+            if (pattern[i] == ']' && in_class) { in_class = 0; i++; continue; }
+            if (!in_class && pattern[i] == '(') {
+                depth++;
+                nested = 1;
+            } else if (!in_class && pattern[i] == ')' && --depth == 0)
+                close = i;
+            i++;
+        }
+        if (close < 0) break;
+        group++;
+        if (!nested) {
+            int n = close - open - 1;
+            if (n >= MAX_STRING) n = MAX_STRING - 1;
+            for (j = 0; j < n; j++) body[j] = pattern[open + 1 + j];
+            body[n] = 0;
+            if (cursor <= matched_len &&
+                regex_span(body, matched + cursor, &start, &length)) {
+                int k;
+                cursor += start;
+                if (length >= MAX_STRING) length = MAX_STRING - 1;
+                for (k = 0; k < length; k++) value[k] = matched[cursor + k];
+                value[length] = 0;
+                set_array_string(aid, group, value);
+                cursor += length;
+            } else set_array_string(aid, group, "");
+        } else set_array_string(aid, group, "");
+    }
+}
 static Value call_builtin(const char *name, Value *args, int argc) {
     Value v = empty_value();
-    char text[MAX_STRING];
+    char text[MAX_STRING], other[MAX_STRING];
     if (seq(name, "length")) {
         if (argc && args[0].kind == V_ARRAY &&
             args[0].array_id >= 0 && args[0].array_id < array_count) {
@@ -717,32 +1488,137 @@ static Value call_builtin(const char *name, Value *args, int argc) {
     }
     if (seq(name, "int") && argc)
         return number_value((long)as_number(args[0]));
+    if (seq(name, "index") && argc >= 2) {
+        int i, j;
+        as_string(args[0], text);
+        as_string(args[1], other);
+        for (i = 0; text[i]; i++) {
+            for (j = 0; other[j] && text[i + j] == other[j]; j++) {}
+            if (!other[j]) return number_value(i + 1);
+        }
+        return number_value(other[0] ? 0 : 1);
+    }
     if (seq(name, "tolower") && argc) {
         int i;
         as_string(args[0], text);
-        for (i = 0; text[i]; i++)
-            if (text[i] >= 'A' && text[i] <= 'Z') text[i] += 32;
+        for (i = 0; text[i]; i++) text[i] = (char)case_lower(text[i]);
         return string_value(text);
     }
     if (seq(name, "toupper") && argc) {
         int i;
         as_string(args[0], text);
-        for (i = 0; text[i]; i++)
-            if (text[i] >= 'a' && text[i] <= 'z') text[i] -= 32;
+        for (i = 0; text[i]; i++) text[i] = (char)case_upper(text[i]);
         return string_value(text);
     }
     if (seq(name, "substr") && argc >= 2) {
         int start = (int)as_number(args[1]) - 1;
-        int len, i;
+        int len, i, source_len;
         as_string(args[0], text);
         if (start < 0) start = 0;
-        len = argc >= 3 ? (int)as_number(args[2]) : slen(text) - start;
+        source_len = slen(text);
+        if (start > source_len) start = source_len;
+        len = argc >= 3 ? (int)as_number(args[2]) : source_len - start;
         if (len < 0) len = 0;
         for (i = 0; i < len && i < MAX_STRING - 1 &&
                     text[start + i]; i++) v.text[i] = text[start + i];
         v.text[i] = 0;
         v.kind = V_STR;
         return v;
+    }
+    if (seq(name, "split") && argc >= 2) {
+        char sep[MAX_STRING];
+        int aid = array_from_value(args[1]);
+        if (aid < 0) { error_flag = 1; return number_value(0); }
+        as_string(args[0], text);
+        if (argc >= 3) as_string(args[2], sep);
+        else {
+            int fs = find_global("FS", 0);
+            if (fs >= 0 && globals[fs].value.kind != V_EMPTY)
+                as_string(globals[fs].value, sep);
+            else scopy(sep, " ", MAX_STRING);
+        }
+        return number_value(split_into_array(text, aid, sep));
+    }
+    if (seq(name, "match") && argc >= 2) {
+        int start, length;
+        as_string(args[0], text);
+        as_string(args[1], other);
+        if (regex_span(other, text, &start, &length)) {
+            set_global("RSTART", number_value(start + 1));
+            set_global("RLENGTH", number_value(length));
+            if (argc >= 3) {
+                int aid = array_from_value(args[2]);
+                if (aid >= 0) {
+                    char match[MAX_STRING];
+                    int i;
+                    for (i = 0; i < length && i < MAX_STRING - 1; i++)
+                        match[i] = text[start + i];
+                    match[i] = 0;
+                    match_captures(other, match, aid);
+                }
+            }
+            return number_value(start + 1);
+        }
+        set_global("RSTART", number_value(0));
+        set_global("RLENGTH", number_value(-1));
+        if (argc >= 3) {
+            int aid = array_from_value(args[2]);
+            clear_array(aid);
+        }
+        return number_value(0);
+    }
+    if ((seq(name, "sub") || seq(name, "gsub")) && argc >= 2) {
+        Value target = argc >= 3 ? args[2] : field_value(0);
+        as_string(args[0], text);
+        as_string(args[1], other);
+        return number_value(substitute_value(text, other, target,
+                          seq(name, "gsub"), argc < 3));
+    }
+    if (seq(name, "close") && argc) {
+        as_string(args[0], text);
+        return number_value(close_io(text));
+    }
+    if (seq(name, "fflush")) {
+        if (!argc) {
+            fflush((FILE *)0);
+            return number_value(0);
+        }
+        as_string(args[0], text);
+        {
+            int i;
+            for (i = 0; i < MAX_IO; i++)
+                if (io_stream[i] && seq(io_name[i], text))
+                    return number_value(fflush(io_stream[i]));
+        }
+        return number_value(-1);
+    }
+    if (seq(name, "sqrt") && argc)
+        return number_value(sqrt_approx(as_number(args[0])));
+    if (seq(name, "exp") && argc)
+        return number_value(exp_approx(as_number(args[0])));
+    if (seq(name, "log") && argc)
+        return number_value(log_approx(as_number(args[0])));
+    if (seq(name, "sin") && argc)
+        return number_value(sin_approx(as_number(args[0])));
+    if (seq(name, "cos") && argc)
+        return number_value(sin_approx(as_number(args[0]) +
+                                       1.5707963267948966));
+    if (seq(name, "atan2") && argc >= 2)
+        return number_value(atan2_approx(as_number(args[0]),
+                                         as_number(args[1])));
+    if (seq(name, "rand")) {
+        random_seed = random_seed * 1103515245UL + 12345UL;
+        return number_value((double)(random_seed & 0x7fffffffUL) /
+                            2147483648.0);
+    }
+    if (seq(name, "srand")) {
+        unsigned long old = random_seed;
+        random_seed = argc ? (unsigned long)as_number(args[0]) : 1UL;
+        return number_value((double)old);
+    }
+    if (seq(name, "system") && argc) {
+        as_string(args[0], text);
+        return number_value(system(text));
     }
     return v;
 }
@@ -764,8 +1640,11 @@ static Value parse_primary(void) {
         return v;
     }
     if (accept('(')) {
+        int old_context = print_context;
+        print_context = 0;
         v = parse_expression();
         require(')');
+        print_context = old_context;
         return v;
     }
     if (accept('$')) {
@@ -778,13 +1657,58 @@ static Value parse_primary(void) {
         int argc = 0, fi;
         scopy(name, token.text, MAX_STRING);
         lex_next();
-        if (seq(name, "NR")) return number_value((double)nr);
-        if (seq(name, "NF")) return number_value((double)nf);
+        if (seq(name, "getline")) {
+            Value target = empty_value(), filename_value;
+            int has_target = 0, from_file = 0, got;
+            char filename[MAX_STRING];
+            FILE *input = data_stream;
+            if (accept('<')) {
+                filename_value = parse_assignment();
+                as_string(filename_value, filename);
+                from_file = 1;
+            } else if (token.kind == TOK_ID || token.kind == '$') {
+                target = parse_primary();
+                has_target = 1;
+                if (accept('<')) {
+                    filename_value = parse_assignment();
+                    as_string(filename_value, filename);
+                    from_file = 1;
+                }
+            }
+            if (!execute_enabled) return number_value(0);
+            if (from_file) input = open_io(filename, 'r');
+            got = read_record(input, !from_file, !has_target, has_target,
+                              target);
+            return number_value(got);
+        }
+        if (seq(name, "NR")) {
+            v = number_value((double)nr);
+            v.ref_kind = 5;
+            return v;
+        }
+        if (seq(name, "FNR")) {
+            v = number_value((double)fnr);
+            v.ref_kind = 6;
+            return v;
+        }
+        if (seq(name, "NF")) {
+            v = number_value((double)nf);
+            v.ref_kind = 4;
+            return v;
+        }
         if (seq(name, "SUBSEP")) {
-            char sep[2];
-            sep[0] = '\034';
-            sep[1] = 0;
-            return string_value(sep);
+            int scope, index, vi;
+            AwkVar *var = resolve_var("SUBSEP", 0, &scope, &index);
+            if (!var) {
+                vi = find_global("SUBSEP", 1);
+                if (vi >= 0 && globals[vi].value.kind == V_EMPTY) {
+                    char sep[2];
+                    sep[0] = '\034';
+                    sep[1] = 0;
+                    globals[vi].value = string_value(sep);
+                }
+            }
+            return get_variable("SUBSEP");
         }
         if (accept('(')) {
             if (token.kind != ')') {
@@ -803,15 +1727,24 @@ static Value parse_primary(void) {
                 return string_value(out);
             }
             if (seq(name, "length") || seq(name, "int") ||
-                seq(name, "tolower") || seq(name, "toupper") ||
-                seq(name, "substr"))
+                seq(name, "index") || seq(name, "tolower") ||
+                seq(name, "toupper") || seq(name, "substr") ||
+                seq(name, "split") || seq(name, "match") ||
+                seq(name, "sub") || seq(name, "gsub") ||
+                seq(name, "close") || seq(name, "fflush") ||
+                seq(name, "sqrt") || seq(name, "exp") ||
+                seq(name, "log") || seq(name, "sin") ||
+                seq(name, "cos") || seq(name, "atan2") ||
+                seq(name, "rand") || seq(name, "srand") ||
+                seq(name, "system"))
                 return call_builtin(name, args, argc);
             fi = find_function(name);
             return call_function(fi, args, argc);
         }
         if (accept('[')) {
-            char key[MAX_KEY];
+            char key[MAX_KEY], subsep[MAX_STRING];
             Value index = parse_assignment();
+            current_subsep(subsep);
             as_string(index, key);
             while (accept(',')) {
                 char part[MAX_KEY], joined[MAX_KEY];
@@ -820,7 +1753,8 @@ static Value parse_primary(void) {
                 as_string(index, part);
                 scopy(joined, key, MAX_KEY);
                 n = slen(joined);
-                if (n < MAX_KEY - 1) joined[n++] = '\034';
+                for (j = 0; subsep[j] && n < MAX_KEY - 1; j++)
+                    joined[n++] = subsep[j];
                 joined[n] = 0;
                 for (j = 0; part[j] && n < MAX_KEY - 1; j++)
                     joined[n++] = part[j];
@@ -940,6 +1874,7 @@ static Value parse_compare(void) {
            token.kind == TOK_LE || token.kind == TOK_GE ||
            token.kind == TOK_MATCH || token.kind == TOK_NMATCH ||
            token.kind == TOK_IN) {
+        if (print_context && token.kind == '>') break;
         op = token.kind;
         lex_next();
         b = parse_concat();
@@ -1115,16 +2050,40 @@ static void format_output(const char *fmt, Value *args, int argc,
         }
     }
 }
-static void print_value(Value v) {
+static void write_text(FILE *dest, const char *text) {
+    if (dest) fputs(text, dest);
+    else printf("%s", text);
+}
+static FILE *parse_output_target(int run) {
+    Value name_value;
+    char name[MAX_STRING];
+    char mode;
+    FILE *dest = 0;
+    if (token.kind != '>' && token.kind != TOK_APPEND) return 0;
+    mode = token.kind == TOK_APPEND ? 'a' : 'w';
+    lex_next();
+    print_context = 0;
+    name_value = parse_assignment();
+    as_string(name_value, name);
+    if (run) {
+        dest = open_io(name, mode);
+        if (!dest) error_flag = 1;
+    }
+    return dest;
+}
+static void print_value(Value v, FILE *dest) {
     char text[MAX_STRING];
     as_string(v, text);
-    printf("%s", text);
+    write_text(dest, text);
 }
 static void print_statement(int run, int formatted) {
     Value args[MAX_PARAMS];
-    int argc = 0, i;
+    int argc = 0, i, old_context = print_context;
+    FILE *dest;
+    print_context = 1;
     if (formatted) {
         if (accept('(')) {
+            print_context = 0;
             if (token.kind != ')') {
                 do {
                     if (argc < MAX_PARAMS) args[argc++] = parse_assignment();
@@ -1132,21 +2091,25 @@ static void print_statement(int run, int formatted) {
                 } while (accept(','));
             }
             require(')');
+            print_context = 1;
         } else {
             do {
                 if (argc < MAX_PARAMS) args[argc++] = parse_assignment();
                 else error_flag = 1;
             } while (accept(','));
         }
+        dest = parse_output_target(run);
         if (run && argc > 0) {
             char fmt[MAX_STRING], out[1024];
             as_string(args[0], fmt);
             format_output(fmt, args + 1, argc - 1, out, sizeof out);
-            printf("%s", out);
+            write_text(dest, out);
         }
+        print_context = old_context;
         return;
     }
     if (accept('(')) {
+        print_context = 0;
         if (token.kind != ')') {
             do {
                 if (argc < MAX_PARAMS) args[argc++] = parse_assignment();
@@ -1154,7 +2117,9 @@ static void print_statement(int run, int formatted) {
             } while (accept(','));
         }
         require(')');
+        print_context = 1;
     } else if (token.kind != TOK_SEMI && token.kind != '}' &&
+        token.kind != '>' && token.kind != TOK_APPEND &&
         token.kind != 0) {
         do {
             if (argc < MAX_PARAMS) args[argc++] = parse_assignment();
@@ -1163,6 +2128,7 @@ static void print_statement(int run, int formatted) {
     } else {
         args[argc++] = field_value(0);
     }
+    dest = parse_output_target(run);
     if (run) {
         int oi = find_global("OFS", 0);
         int ri = find_global("ORS", 0);
@@ -1174,11 +2140,12 @@ static void print_statement(int run, int formatted) {
             as_string(globals[ri].value, end);
         else scopy(end, "\n", MAX_STRING);
         for (i = 0; i < argc; i++) {
-            if (i) printf("%s", sep);
-            print_value(args[i]);
+            if (i) write_text(dest, sep);
+            print_value(args[i], dest);
         }
-        printf("%s", end);
+        write_text(dest, end);
     }
+    print_context = old_context;
 }
 static void skip_balanced(int left, int right) {
     int depth = 1;
@@ -1210,6 +2177,7 @@ static int find_statement_end(int start) {
     } else if (token.kind == TOK_ID && seq(token.text, "if")) {
         lex_next();
         if (token.kind == '(') skip_balanced('(', ')');
+        skip_semis();
         body_end = find_statement_end(token.start);
         set_parser(body_end);
         if (token.kind == TOK_ID && seq(token.text, "else")) {
@@ -1220,6 +2188,7 @@ static int find_statement_end(int start) {
                (seq(token.text, "while") || seq(token.text, "for"))) {
         lex_next();
         if (token.kind == '(') skip_balanced('(', ')');
+        skip_semis();
         end = find_statement_end(token.start);
     } else if (token.kind == TOK_ID && seq(token.text, "do")) {
         lex_next();
@@ -1268,6 +2237,7 @@ static Value parse_statement_impl(int run) {
         require('(');
         result = parse_expression();
         require(')');
+        skip_semis();
         cond = truth(result);
         parse_statement(run && cond);
         skip_semis();
@@ -1283,6 +2253,7 @@ static Value parse_statement_impl(int run) {
         cond_pos = token.start;
         skip_to_delimiter(')');
         require(')');
+        skip_semis();
         body_start = token.start;
         loop_end = find_statement_end(body_start);
         loop = 0;
@@ -1348,6 +2319,7 @@ static Value parse_statement_impl(int run) {
                     scopy(array_name, token.text, MAX_STRING);
                     lex_next();
                     require(')');
+                    skip_semis();
                     body_start = token.start;
                     loop_end = find_statement_end(body_start);
                     av = resolve_var(array_name, 1, &scope, &vi);
@@ -1385,6 +2357,7 @@ static Value parse_statement_impl(int run) {
         inc_pos = token.start;
         skip_to_delimiter(')');
         require(')');
+        skip_semis();
         body_start = token.start;
         loop_end = find_statement_end(body_start);
         loop = 0;
@@ -1457,6 +2430,8 @@ static Value parse_statement_impl(int run) {
         var = resolve_var(name, 1, &scope, &vi);
         if (accept('[')) {
             Value idx = parse_assignment();
+            char subsep[MAX_STRING];
+            current_subsep(subsep);
             as_string(idx, key);
             while (accept(',')) {
                 char part[MAX_KEY], joined[MAX_KEY];
@@ -1465,7 +2440,8 @@ static Value parse_statement_impl(int run) {
                 as_string(idx, part);
                 scopy(joined, key, MAX_KEY);
                 n = slen(joined);
-                if (n < MAX_KEY - 1) joined[n++] = '\034';
+                for (k = 0; subsep[k] && n < MAX_KEY - 1; k++)
+                    joined[n++] = subsep[k];
                 joined[n] = 0;
                 for (k = 0; part[k] && n < MAX_KEY - 1; k++)
                     joined[n++] = part[k];
@@ -1538,7 +2514,9 @@ static int parse_function(void) {
             lex_next();
         } while (accept(','));
     }
-    if (!require(')') || token.kind != '{') return 0;
+    if (!require(')')) return 0;
+    skip_semis();
+    if (token.kind != '{') return 0;
     start = token.start;
     end = find_statement_end(start);
     fn->body_start = start;
@@ -1669,9 +2647,17 @@ int main(int argc, char **argv) {
     frame_depth = 0;
     flow_state = FLOW_NONE;
     nr = 0;
+    fnr = 0;
     nf = 0;
     error_flag = 0;
+    set_global("FILENAME", string_value(data_id));
     run_data = 1;
+    data = fopen(data_id, "r");
+    if (!data) {
+        puts("CMSAWK: cannot open data file");
+        return 8;
+    }
+    data_stream = data;
     for (i = 0; i < rule_count; i++) {
         if (rules[i].kind == RULE_BEGIN) {
             flow_state = FLOW_NONE;
@@ -1686,13 +2672,7 @@ int main(int argc, char **argv) {
             }
         }
     }
-    data = 0;
     if (run_data && !error_flag) {
-        data = fopen(data_id, "r");
-        if (!data) {
-            puts("CMSAWK: cannot open data file");
-            return 8;
-        }
         while (fgets(record, sizeof record, data)) {
             record_length = slen(record);
             while (record_length > 0 &&
@@ -1704,6 +2684,7 @@ int main(int argc, char **argv) {
                 break;
             }
             nr++;
+            fnr++;
             split_fields();
             flow_state = FLOW_NONE;
             for (i = 0; i < rule_count; i++) {
@@ -1724,14 +2705,16 @@ int main(int argc, char **argv) {
             else if (flow_state == FLOW_EXIT) break;
             if (error_flag) break;
         }
-        fclose(data);
     }
+    fclose(data);
+    data_stream = 0;
     for (i = 0; i < rule_count; i++) {
         if (rules[i].kind == RULE_END) {
             flow_state = FLOW_NONE;
             if (!execute_rule(&rules[i])) error_flag = 1;
         }
     }
+    close_all_io();
     if (error_flag) {
         puts("CMSAWK: runtime error or resource limit exceeded");
         return 8;
