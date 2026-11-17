@@ -1,50 +1,69 @@
-# CMSED
+# CMSED 0.2
 
-CMSED is a small C89, record-oriented stream editor for CMS. It reads a CMS
-script file and one or more CMS input files, then writes edited records to the
-console. It never edits input files in place.
+CMSED is a small C89 stream editor that processes records. The CMS build reads
+and writes CMS files; the host build accepts ordinary paths and standard input.
+It does not implement every GNU or POSIX sed extension.
 
 ## Build and run on CMS
 
-Build on the CMS C toolchain:
+Build on CMS with GCCCMS:
 
 ```
 CMSCLNK S2SED PLAIN
 ```
 
-The command format is:
+CMS invocation uses `fn ft fm` triples:
 
 ```
-S2SED scriptFN scriptFT scriptFM dataFN dataFT dataFM [...]
+S2SED [-n] [-e command] [-f scriptFN scriptFT scriptFM]
+      scriptFN scriptFT scriptFM dataFN dataFT dataFM [...]
 ```
 
-For example:
+If no `-e` or `-f` is given, the first triple is the script file.
+CMS `-i` stages each result and preserves the original as `S2B#### SEDBAK`
+on the same filemode.
+
+## Host build and run
 
 ```
-S2SED S2T1 SED A1 S2D1 DATA A1
+gcc -std=c89 -DCMSED_HOST -o s2sed cmsed.c
+s2sed -n -e 's/foo/bar/g' input.txt
+s2sed -f script.sed input.txt
 ```
 
-## Supported script subset
+Host mode reads standard input when no input path is provided. `-i` stages
+output in a sibling temporary file and renames it only after success.
 
-Each nonblank script record contains one command:
+## Supported commands
 
-- `s/regex/replacement/` replaces the first match.
-- `s/regex/replacement/g` replaces every non-overlapping match.
-- `d` deletes the current record.
-- `p` prints the current record in addition to default output.
-- `q` prints the current record and stops.
+Each script record holds one command. `-e` adds one command and `-f` loads a
+script file. The implemented commands are:
 
-One address may precede a command: a 1-based input line number or `/regex/`.
-Append `!` to invert an address. Line numbers continue across input files.
-Patterns support literals, `.`, `^`, `$`, `*`, bracket classes and ranges.
-Backslash quotes the next pattern character. In replacements, `&` expands to
-the complete match, and backslash quotes the next character.
+- `s/regex/replacement/`, with `g` and `p` flags
+- `d`, `p`, `q`
+- `y/source/destination/`
+- `h`, `H`, `g`, `G`, `x`
+- `b label`, `t label`, and `:label`
+- `a`, `i`, `c`, `r`, and `w`
 
-This is a small sed subset, not a GNU/POSIX sed replacement. It does not
-support address ranges, capture groups/backreferences, `-n`, branching, hold
-space, or in-place editing. CMS records are lines, bounded to 1023 characters.
+Addresses support line numbers, `$`, `/regex/`, `!`, and two-address ranges.
+Line numbers are cumulative across input files. Substitutions support `&`,
+escaped capture groups `\(...\)`, and backreferences `\1` through `\9`.
 
-## Tests
+The basic regular-expression subset supports literals, `.`, `^`, `$`, `*`,
+bracket classes/ranges, groups, and backreferences. It does not support
+alternation, `+`, `?`, intervals, POSIX character classes, or semicolon-
+separated commands. Other GNU sed options are not implemented.
 
-`tests/` contains a smoke script, input, and expected output. It covers global
-substitution, regex and numeric addresses, delete, print, and quit.
+Records are limited to 1023 characters, script records to 255 characters,
+commands to 128, and input files to 16. CMS scripts and inputs are CMS files;
+host paths and stdin are host-only.
+
+## Smoke test
+
+`tests/test.sed`, `tests/test.in`, and `tests/test.expected` cover substitution,
+addresses, delete, print, backreferences, and quit. Run on CMS with:
+
+```
+S2SED S2TSCR SED A1 S2TDATA DATA A1
+```
