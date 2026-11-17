@@ -1,6 +1,7 @@
-/* CMSAWK 0.5: C89 AWK interpreter for GCCCMS/PDPCLIB. */
-/* Adds getline, redirection, mutable fields and common POSIX built-ins. */
-/* ERE subset, fixed tables and strings bounded for CMS memory. */
+/* CMSAWK 0.6: C89 AWK interpreter for GCCCMS/PDPCLIB. */
+/* Adds ARGV input lists, nested ERE captures and numeric backreferences. */
+/* Command pipes require POPEN/PCLOSE, absent from this PDPCLIB runtime. */
+/* Fixed tables and strings are bounded for CMS memory. */
 typedef struct cms_file FILE;
 extern FILE *fopen(const char *, const char *);
 extern char *fgets(char *, int, FILE *);
@@ -12,12 +13,16 @@ extern int fputs(const char *, FILE *);
 extern int fflush(FILE *);
 extern int fseek(FILE *, long, int);
 extern int system(const char *);
+
 enum {
     SOURCE_SIZE = 16384, MAX_RULES = 64, MAX_FUNCS = 24,
     MAX_VARS = 64, MAX_ARRAYS = 32, MAX_ITEMS = 64,
     MAX_STRING = 128, MAX_KEY = 64, MAX_RECORD = 1024,
     MAX_FIELDS = 64, MAX_PARAMS = 16, MAX_FRAMES = 12, MAX_IO = 8,
+    MAX_INPUT_FILES = 16,
     MAX_APPEND_COPY = 65536,
+    MAX_RX_NODES = 256, MAX_RX_CODE = 512,
+    MAX_RX_STACK = MAX_RECORD + 16, MAX_RX_GROUPS = 9,
     TOK_ID = 256, TOK_NUM, TOK_STR, TOK_REGEX, TOK_SEMI,
     TOK_EQ, TOK_NE, TOK_LE, TOK_GE, TOK_AND, TOK_OR,
     TOK_INC, TOK_DEC, TOK_ADD_EQ, TOK_SUB_EQ, TOK_MUL_EQ,
@@ -29,6 +34,15 @@ enum {
     FLOW_NONE = 0, FLOW_BREAK, FLOW_CONTINUE, FLOW_NEXT,
     FLOW_EXIT, FLOW_RETURN
 };
+
+enum {
+    RX_EMPTY = 1, RX_CHAR, RX_ANY, RX_CLASS, RX_BOL, RX_EOL,
+    RX_BACKREF, RX_SEQ, RX_ALT, RX_GROUP, RX_STAR, RX_PLUS,
+    RX_OPTIONAL, RX_RANGE,
+    RXI_CHAR = 1, RXI_ANY, RXI_CLASS, RXI_BOL, RXI_EOL,
+    RXI_BACKREF, RXI_SPLIT, RXI_SAVE_START, RXI_SAVE_END, RXI_MATCH
+};
+
 typedef struct {
     int kind;
     double number;
@@ -38,16 +52,19 @@ typedef struct {
     int ref_index;
     int ref_entry;
 } Value;
+
 typedef struct {
     int used;
     char key[MAX_KEY];
     Value value;
 } ArrayItem;
+
 typedef struct {
     int used;
     int count;
     ArrayItem item[MAX_ITEMS];
 } AwkArray;
+
 typedef struct {
     int used;
     char name[MAX_STRING];
@@ -56,6 +73,7 @@ typedef struct {
     int alias_kind;
     int alias_index;
 } AwkVar;
+
 typedef struct {
     int kind;
     int pattern_start;
@@ -63,6 +81,7 @@ typedef struct {
     int body_end;
     char pattern[MAX_STRING];
 } AwkRule;
+
 typedef struct {
     int used;
     char name[MAX_STRING];
@@ -71,6 +90,7 @@ typedef struct {
     int body_start;
     int body_end;
 } AwkFunction;
+
 typedef struct {
     int kind;
     int start;
@@ -78,19 +98,46 @@ typedef struct {
     double number;
     char text[MAX_STRING];
 } Token;
+
 typedef struct {
     int pos;
     Token token;
     int regex_next;
 } ParserState;
+
 typedef struct {
     AwkVar var[MAX_PARAMS];
     int count;
     int flow;
     Value result;
 } CallFrame;
+
+typedef struct {
+    int kind;
+    int left;
+    int right;
+    int value;
+    int minimum;
+    int maximum;
+} RxNode;
+
+typedef struct {
+    int op;
+    int x;
+    int y;
+    int value;
+} RxInstruction;
+
+typedef struct {
+    int pc;
+    int pos;
+    int start[MAX_RX_GROUPS + 1];
+    int end[MAX_RX_GROUPS + 1];
+} RxState;
+
 static char source[SOURCE_SIZE];
 static int source_length;
+static unsigned char newline_sep[SOURCE_SIZE];
 static int source_pos;
 static Token token;
 static int regex_next;
@@ -119,19 +166,35 @@ static int print_context;
 static int regex_icase;
 static unsigned long random_seed = 1UL;
 static FILE *data_stream;
+static int input_index;
 static FILE *io_stream[MAX_IO];
 static char io_name[MAX_IO][MAX_STRING];
 static char io_mode[MAX_IO];
 static char append_copy[MAX_APPEND_COPY];
+static RxNode rx_nodes[MAX_RX_NODES];
+static RxInstruction rx_code[MAX_RX_CODE];
+static RxState rx_stack[MAX_RX_STACK];
+static char rx_pattern[MAX_STRING];
+static int rx_node_count;
+static int rx_code_count;
+static int rx_parse_pos;
+static int rx_group_count;
+static int rx_parse_error;
+static int rx_capture_start[MAX_RX_GROUPS + 1];
+static int rx_capture_end[MAX_RX_GROUPS + 1];
 static void format_output(const char *, Value *, int, char *, int);
 static int assign_field(int, Value);
 static int assign_nf(Value);
 static void split_fields(void);
+static int next_main_line(char *);
+static void set_global(const char *, Value);
+
 static int slen(const char *s) {
     int n = 0;
     while (s[n]) n++;
     return n;
 }
+
 static void scopy(char *to, const char *from, int limit) {
     int i = 0;
     while (from[i] && i < limit - 1) {
@@ -140,12 +203,15 @@ static void scopy(char *to, const char *from, int limit) {
     }
     to[i] = 0;
 }
+
 static int seq(const char *a, const char *b) {
     int i = 0;
     while (a[i] && b[i] && a[i] == b[i]) i++;
     return a[i] == 0 && b[i] == 0;
 }
+
 static FILE *open_append_copy(const char *);
+
 static FILE *open_io(const char *name, char mode) {
     int i, free_slot = -1;
     const char *access = mode == 'r' ? "r" : mode == 'a' ? "a" : "w";
@@ -177,6 +243,7 @@ static FILE *open_io(const char *name, char mode) {
     io_mode[free_slot] = mode;
     return io_stream[free_slot];
 }
+
 static int close_io(const char *name) {
     int i, found = 0, rc = 0;
     for (i = 0; i < MAX_IO; i++) {
@@ -191,6 +258,7 @@ static int close_io(const char *name) {
     }
     return found ? rc : -1;
 }
+
 static void close_all_io(void) {
     int i;
     for (i = 0; i < MAX_IO; i++) {
@@ -201,6 +269,7 @@ static void close_all_io(void) {
         }
     }
 }
+
 static FILE *open_append_copy(const char *name) {
     FILE *input, *output;
     char line[MAX_RECORD];
@@ -226,28 +295,41 @@ static FILE *open_append_copy(const char *name) {
     }
     return output;
 }
+
 static int is_space(char c) {
-    return c == ' ' || c == '\t' || c == '\r';
+    return c == ' ' || c == '\t' || c == '\r' || c == '\n' ||
+           c == '\v' || c == '\f';
 }
+
 static int is_alpha(char c) {
     return (c >= 'A' && c <= 'I') || (c >= 'J' && c <= 'R') ||
            (c >= 'S' && c <= 'Z') || (c >= 'a' && c <= 'i') ||
            (c >= 'j' && c <= 'r') || (c >= 's' && c <= 'z');
 }
+
 static int is_digit(char c) {
     return c >= '0' && c <= '9';
 }
+
 static void token_text(Token *t, const char *s, int n) {
     int i;
     if (n >= MAX_STRING) n = MAX_STRING - 1;
     for (i = 0; i < n; i++) t->text[i] = s[i];
     t->text[n] = 0;
 }
+
 static void lex_next(void) {
     int start, n;
     char c;
     while (source_pos < source_length) {
         c = source[source_pos];
+        if (c == '\n') {
+            if (!newline_sep[source_pos]) {
+                source_pos++;
+                continue;
+            }
+            break;
+        }
         if (is_space(c)) {
             source_pos++;
             continue;
@@ -393,6 +475,7 @@ static void lex_next(void) {
     if (token.kind == TOK_MATCH || token.kind == TOK_NMATCH) regex_next = 1;
     token.end = source_pos;
 }
+
 static ParserState save_parser(void) {
     ParserState s;
     s.pos = source_pos;
@@ -400,29 +483,77 @@ static ParserState save_parser(void) {
     s.regex_next = regex_next;
     return s;
 }
+
 static void restore_parser(ParserState s) {
     source_pos = s.pos;
     token = s.token;
     regex_next = s.regex_next;
 }
+
 static void set_parser(int pos) {
     source_pos = pos;
     regex_next = 0;
     lex_next();
 }
+
 static int accept(int kind) {
     if (token.kind != kind) return 0;
     lex_next();
     return 1;
 }
+
 static int require(int kind) {
     if (accept(kind)) return 1;
     error_flag = 1;
     return 0;
 }
+
 static void skip_semis(void) {
     while (accept(TOK_SEMI)) {}
 }
+
+/* A newline ends a statement unless it follows a token that cannot end one
+   (an operator, a comma, an opening brace) or sits inside parentheses or
+   brackets.  The interpreter replays the lexer for every rule, so the
+   decision is precomputed once per load instead of tracked as lexer state. */
+static int statement_continues(int k) {
+    switch (k) {
+    case 0: case '{': case '(': case '[': case ',': case ';': case TOK_SEMI:
+    case '=': case TOK_EQ: case TOK_NE: case '<': case '>': case TOK_LE:
+    case TOK_GE: case TOK_AND: case TOK_OR: case TOK_MATCH: case TOK_NMATCH:
+    case TOK_IN: case TOK_APPEND: case TOK_ADD_EQ: case TOK_SUB_EQ:
+    case TOK_MUL_EQ: case TOK_DIV_EQ: case TOK_MOD_EQ: case '+': case '-':
+    case '*': case '/': case '%': case '!': case '?': case ':': case '&':
+    case '|': case '~':
+        return 1;
+    }
+    return 0;
+}
+
+static void classify_newlines(void) {
+    int i, depth = 0, prev = 0, prev_end = 0;
+    for (i = 0; i < SOURCE_SIZE; i++) newline_sep[i] = 0;
+    source_pos = 0;
+    token.kind = 0;
+    regex_next = 0;
+    lex_next();
+    while (token.kind) {
+        for (i = prev_end; i < token.start; i++)
+            if (source[i] == '\n')
+                newline_sep[i] =
+                    (unsigned char)(depth == 0 && !statement_continues(prev));
+        if (token.kind == '(' || token.kind == '[') depth++;
+        else if ((token.kind == ')' || token.kind == ']') && depth > 0) depth--;
+        prev = token.kind;
+        prev_end = token.end;
+        lex_next();
+    }
+    for (i = prev_end; i < source_length; i++)
+        if (source[i] == '\n')
+            newline_sep[i] =
+                (unsigned char)(depth == 0 && !statement_continues(prev));
+}
+
 static Value empty_value(void) {
     Value v;
     int i;
@@ -436,18 +567,21 @@ static Value empty_value(void) {
     for (i = 1; i < MAX_STRING; i++) v.text[i] = 0;
     return v;
 }
+
 static Value number_value(double n) {
     Value v = empty_value();
     v.kind = V_NUM;
     v.number = n;
     return v;
 }
+
 static Value string_value(const char *s) {
     Value v = empty_value();
     v.kind = V_STR;
     scopy(v.text, s, MAX_STRING);
     return v;
 }
+
 static int number_string(const char *s, double *out) {
     int i = 0, sign = 1, digits = 0;
     int exponent = 0, exponent_sign = 1;
@@ -484,23 +618,27 @@ static int number_string(const char *s, double *out) {
     *out = sign * n;
     return 1;
 }
+
 static double as_number(Value v) {
     double n;
     if (v.kind == V_NUM) return v.number;
     if (v.kind == V_STR && number_string(v.text, &n)) return n;
     return 0;
 }
+
 static void as_string(Value v, char *out) {
     if (v.kind == V_STR || v.kind == V_EMPTY) scopy(out, v.text, MAX_STRING);
     else if (v.kind == V_NUM) sprintf(out, "%.10g", v.number);
     else scopy(out, "", MAX_STRING);
 }
+
 static int truth(Value v) {
     if (v.kind == V_EMPTY) return 0;
     if (v.kind == V_STR) return v.text[0] != 0;
     if (v.kind == V_ARRAY) return 1;
     return v.number != 0;
 }
+
 static int find_global(const char *name, int create) {
     int i;
     for (i = 0; i < global_count; i++)
@@ -515,6 +653,7 @@ static int find_global(const char *name, int create) {
     globals[i].alias_index = -1;
     return i;
 }
+
 static int find_local(const char *name, int create) {
     int i;
     CallFrame *f;
@@ -532,6 +671,7 @@ static int find_local(const char *name, int create) {
     f->var[i].alias_index = -1;
     return i;
 }
+
 static AwkVar *resolve_var(const char *name, int create,
                            int *scope, int *index) {
     int i;
@@ -549,6 +689,7 @@ static AwkVar *resolve_var(const char *name, int create,
     *index = i;
     return &globals[i];
 }
+
 static AwkVar *ref_var(int scope, int index) {
     if (scope > 0 && scope <= frame_depth)
         return &frames[scope - 1].var[index];
@@ -556,6 +697,7 @@ static AwkVar *ref_var(int scope, int index) {
         return &globals[index];
     return 0;
 }
+
 static int new_array(void) {
     int i;
     if (array_count >= MAX_ARRAYS) return -1;
@@ -564,6 +706,7 @@ static int new_array(void) {
     arrays[i].count = 0;
     return i;
 }
+
 static int ensure_array(AwkVar *v) {
     if (v->array_id >= 0) return v->array_id;
     if (v->alias_kind) {
@@ -582,6 +725,7 @@ static int ensure_array(AwkVar *v) {
     v->array_id = new_array();
     return v->array_id;
 }
+
 static int array_item(int aid, const char *key, int create) {
     int i;
     int free_slot = -1;
@@ -602,9 +746,11 @@ static int array_item(int aid, const char *key, int create) {
     arrays[aid].item[i].value = empty_value();
     return i;
 }
+
 static int ref_kind_array(void) {
     return 2;
 }
+
 static Value get_variable(const char *name) {
     Value v = empty_value();
     AwkVar *var;
@@ -622,6 +768,7 @@ static Value get_variable(const char *name) {
     if (var->array_id >= 0) v.kind = V_ARRAY;
     return v;
 }
+
 static void current_subsep(char *out) {
     AwkVar *var;
     int scope, index;
@@ -635,6 +782,7 @@ static void current_subsep(char *out) {
     def[1] = 0;
     scopy(out, def, MAX_STRING);
 }
+
 static Value get_element(const char *name, const char *key, int create) {
     Value v = empty_value();
     AwkVar *var;
@@ -650,6 +798,7 @@ static Value get_element(const char *name, const char *key, int create) {
     v.ref_entry = entry;
     return v;
 }
+
 static void assign_ref(Value ref, Value value) {
     AwkVar *var;
     if (ref.ref_kind == 1) {
@@ -673,7 +822,9 @@ static void assign_ref(Value ref, Value value) {
         arrays[ref.ref_index].item[ref.ref_entry].value = value;
     } else error_flag = 1;
 }
+
 static int regex_span(const char *, const char *, int *, int *);
+
 static void split_fields(void) {
     int i = 0, fs_index = find_global("FS", 0), fs_len;
     char fs[MAX_STRING];
@@ -726,6 +877,7 @@ static void split_fields(void) {
         }
     }
 }
+
 static Value field_value(int n) {
     char text[MAX_STRING];
     int i, len;
@@ -744,6 +896,7 @@ static Value field_value(int n) {
     v.ref_index = n;
     return v;
 }
+
 static void save_fields(void) {
     int i, j, len;
     for (i = 0; i < MAX_FIELDS; i++) field_text[i][0] = 0;
@@ -755,6 +908,7 @@ static void save_fields(void) {
         field_text[i][len] = 0;
     }
 }
+
 static void rebuild_record(int count) {
     char rebuilt[MAX_RECORD], ofs[MAX_STRING];
     int oi = find_global("OFS", 0);
@@ -778,6 +932,7 @@ static void rebuild_record(int count) {
     record_length = used;
     nf = count;
 }
+
 static int assign_field(int n, Value value) {
     char text[MAX_STRING];
     int count;
@@ -798,6 +953,7 @@ static int assign_field(int n, Value value) {
     rebuild_record(count);
     return 1;
 }
+
 static int assign_nf(Value value) {
     int count = (int)as_number(value);
     if (count < 0 || count > MAX_FIELDS) {
@@ -808,12 +964,15 @@ static int assign_nf(Value value) {
     rebuild_record(count);
     return 1;
 }
+
 static int case_lower(char);
 static int case_upper(char);
 static int regex_class(const char *, int, char);
+
 static int regex_equal(char a, char b) {
     return a == b || (regex_icase && case_lower(a) == case_lower(b));
 }
+
 static int regex_atom(const char **p, char c) {
     const char *q = *p;
     int neg = 0, hit = 0;
@@ -843,6 +1002,10 @@ static int regex_atom(const char **p, char c) {
     }
     q++;
     if (*q == '^') { neg = 1; q++; }
+    if (*q == ']') {
+        if (regex_equal(c, *q)) hit = 1;
+        q++;
+    }
     while (*q && *q != ']') {
         if (q[0] == '[' && q[1] == ':') {
             const char *end = q + 2;
@@ -853,6 +1016,18 @@ static int regex_atom(const char **p, char c) {
                 q = end + 2;
             } else {
                 if (c == *q) hit = 1;
+                q++;
+            }
+        } else if (q[0] == '[' &&
+                   (q[1] == '.' || q[1] == '=')) {
+            const char *end = q + 2;
+            char marker = q[1];
+            while (*end && !(end[0] == marker && end[1] == ']')) end++;
+            if (end[0] == marker && end[1] == ']') {
+                if (end == q + 3 && regex_equal(c, q[2])) hit = 1;
+                q = end + 2;
+            } else {
+                if (regex_equal(c, *q)) hit = 1;
                 q++;
             }
         } else if (q[1] == '-' && q[2] && q[2] != ']') {
@@ -872,8 +1047,44 @@ static int regex_atom(const char **p, char c) {
     *p = q;
     return neg ? !hit : hit;
 }
+
+static int regex_class(const char *name, int length, char c) {
+    int lower = case_lower(c), upper = case_upper(c);
+    if (length == 5 && name[0] == 'd' && name[1] == 'i')
+        return is_digit(c);
+    if (length == 5 && name[0] == 'a' && name[1] == 'l' &&
+        name[2] == 'p') return is_alpha(c);
+    if (length == 5 && name[0] == 'a' && name[1] == 'l' &&
+        name[2] == 'n') return is_alpha(c) || is_digit(c);
+    if (length == 4 && name[0] == 'w')
+        return is_alpha(c) || is_digit(c) || c == '_';
+    if (length == 5 && name[0] == 's' && name[1] == 'p')
+        return is_space(c) || c == '\n';
+    if (length == 5 && name[0] == 'b' && name[1] == 'l')
+        return c == ' ' || c == '\t';
+    if (length == 5 && name[0] == 'l' && name[1] == 'o')
+        return (lower == c || regex_icase) && is_alpha(c);
+    if (length == 5 && name[0] == 'u' && name[1] == 'p')
+        return (upper == c || regex_icase) && is_alpha(c);
+    if (length == 6 && name[0] == 'x' && name[1] == 'd')
+        return is_digit(c) || (lower >= 'a' && lower <= 'f');
+    if (length == 5 && name[0] == 'c' && name[1] == 'n')
+        return c < ' ' || c == 127;
+    if (length == 5 && name[0] == 'g' && name[1] == 'r')
+        return c > ' ' && c != 127;
+    if (length == 5 && name[0] == 'p' && name[1] == 'r')
+        return c >= ' ' && c != 127;
+    if (length == 5 && name[0] == 'p' && name[1] == 'u')
+        return c > ' ' && c != 127 && !is_alpha(c) && !is_digit(c);
+    if (length == 5 && name[0] == 'a' && name[1] == 's')
+        return (unsigned char)c <= 127;
+    return 0;
+}
+
+#if 0
 static int regex_here_end(const char *p, const char *s,
                           const char **match_end);
+
 static int regex_repeat_range(const char *atom, const char *rest,
                               const char *s, int count, int minimum,
                               int maximum, const char **match_end) {
@@ -888,6 +1099,7 @@ static int regex_repeat_range(const char *atom, const char *rest,
         return regex_here_end(rest, s, match_end);
     return 0;
 }
+
 static int regex_repeat(const char *atom, const char *rest,
                         const char *s, const char **match_end) {
     const char *next;
@@ -898,6 +1110,7 @@ static int regex_repeat(const char *atom, const char *rest,
     }
     return regex_here_end(rest, s, match_end);
 }
+
 static int regex_class(const char *name, int length, char c) {
     int lower = case_lower(c), upper = case_upper(c);
     if (length == 5 && name[0] == 'd' && name[1] == 'i')
@@ -920,6 +1133,7 @@ static int regex_class(const char *name, int length, char c) {
         return is_digit(c) || (lower >= 'a' && lower <= 'f');
     return 0;
 }
+
 static int regex_here_end(const char *p, const char *s,
                           const char **match_end) {
     const char *q = p;
@@ -968,6 +1182,7 @@ static int regex_here_end(const char *p, const char *s,
     }
     return hit && regex_here_end(q, s + 1, match_end);
 }
+
 static int regex_span_one(const char *p, const char *s,
                           int *start, int *length) {
     const char *at = s, *end;
@@ -989,6 +1204,7 @@ static int regex_span_one(const char *p, const char *s,
         offset++;
     }
 }
+
 static int regex_append(char *to, int used, int cap, const char *from) {
     int i = 0;
     while (from[i] && used + i < cap - 1) {
@@ -998,6 +1214,7 @@ static int regex_append(char *to, int used, int cap, const char *from) {
     to[used + i] = 0;
     return used + i;
 }
+
 static void regex_expand(const char *p, char out[][MAX_STRING],
                          int *count, int depth) {
     int i, open = -1, close = -1, level = 0, escaped = 0, in_class = 0;
@@ -1073,6 +1290,7 @@ static void regex_expand(const char *p, char out[][MAX_STRING],
     scopy(out[*count], p, MAX_STRING);
     (*count)++;
 }
+
 static int regex_span(const char *p, const char *s,
                       int *start, int *length) {
     char alternatives[32][MAX_STRING];
@@ -1095,26 +1313,467 @@ static int regex_span(const char *p, const char *s,
     regex_icase = old_icase;
     return found;
 }
+
 static int regex_match(const char *p, const char *s) {
     int start, length;
     return regex_span(p, s, &start, &length);
 }
+#endif
+
+static int rx_new(int kind, int left, int right, int value,
+                  int minimum, int maximum) {
+    int i;
+    if (rx_node_count >= MAX_RX_NODES) {
+        rx_parse_error = 1;
+        return 0;
+    }
+    i = rx_node_count++;
+    rx_nodes[i].kind = kind;
+    rx_nodes[i].left = left;
+    rx_nodes[i].right = right;
+    rx_nodes[i].value = value;
+    rx_nodes[i].minimum = minimum;
+    rx_nodes[i].maximum = maximum;
+    return i;
+}
+
+static int rx_parse_alt(void);
+
+static int rx_parse_atom(void) {
+    char c;
+    int start, group, child, length;
+    if (!rx_pattern[rx_parse_pos]) {
+        rx_parse_error = 1;
+        return 0;
+    }
+    c = rx_pattern[rx_parse_pos++];
+    if (c == '(') {
+        group = ++rx_group_count;
+        if (group > MAX_RX_GROUPS) rx_parse_error = 1;
+        child = rx_parse_alt();
+        if (rx_pattern[rx_parse_pos] != ')') rx_parse_error = 1;
+        else rx_parse_pos++;
+        return rx_new(RX_GROUP, child, 0, group, 0, 0);
+    }
+    if (c == '[') {
+        start = rx_parse_pos - 1;
+        if (rx_pattern[rx_parse_pos] == '^') rx_parse_pos++;
+        if (rx_pattern[rx_parse_pos] == ']') rx_parse_pos++;
+        while (rx_pattern[rx_parse_pos]) {
+            char marker;
+            if (rx_pattern[rx_parse_pos] == '\\' &&
+                rx_pattern[rx_parse_pos + 1]) {
+                rx_parse_pos += 2;
+                continue;
+            }
+            if (rx_pattern[rx_parse_pos] == '[' &&
+                (rx_pattern[rx_parse_pos + 1] == ':' ||
+                 rx_pattern[rx_parse_pos + 1] == '.' ||
+                 rx_pattern[rx_parse_pos + 1] == '=')) {
+                marker = rx_pattern[rx_parse_pos + 1];
+                rx_parse_pos += 2;
+                while (rx_pattern[rx_parse_pos] &&
+                       !(rx_pattern[rx_parse_pos] == marker &&
+                         rx_pattern[rx_parse_pos + 1] == ']'))
+                    rx_parse_pos++;
+                if (rx_pattern[rx_parse_pos]) rx_parse_pos += 2;
+                continue;
+            }
+            if (rx_pattern[rx_parse_pos++] == ']') break;
+        }
+        length = rx_parse_pos - start;
+        if (rx_pattern[rx_parse_pos - 1] != ']') rx_parse_error = 1;
+        return rx_new(RX_CLASS, 0, 0, start, length, 0);
+    }
+    if (c == '\\') {
+        c = rx_pattern[rx_parse_pos++];
+        if (!c) {
+            rx_parse_error = 1;
+            return 0;
+        }
+        if (c >= '1' && c <= '9')
+            return rx_new(RX_BACKREF, 0, 0, c - '0', 0, 0);
+        if (c == 'd' || c == 'D' || c == 'w' || c == 'W' ||
+            c == 's' || c == 'S') {
+            rx_pattern[rx_parse_pos - 2] = '\\';
+            return rx_new(RX_CLASS, 0, 0, rx_parse_pos - 2, 2, 0);
+        }
+        if (c == 'n') c = '\n';
+        else if (c == 't') c = '\t';
+        else if (c == 'r') c = '\r';
+        return rx_new(RX_CHAR, 0, 0, (unsigned char)c, 0, 0);
+    }
+    if (c == '.') return rx_new(RX_ANY, 0, 0, 0, 0, 0);
+    if (c == '^') return rx_new(RX_BOL, 0, 0, 0, 0, 0);
+    if (c == '$') return rx_new(RX_EOL, 0, 0, 0, 0, 0);
+    if (c == ')' || c == '|') {
+        rx_parse_error = 1;
+        return 0;
+    }
+    return rx_new(RX_CHAR, 0, 0, (unsigned char)c, 0, 0);
+}
+
+static int rx_parse_repeat(void) {
+    int atom, minimum, maximum, digits;
+    char c;
+    const char *p;
+    atom = rx_parse_atom();
+    c = rx_pattern[rx_parse_pos];
+    if (c == '*') {
+        rx_parse_pos++;
+        return rx_new(RX_STAR, atom, 0, 0, 0, -1);
+    }
+    if (c == '+') {
+        rx_parse_pos++;
+        return rx_new(RX_PLUS, atom, 0, 0, 1, -1);
+    }
+    if (c == '?') {
+        rx_parse_pos++;
+        return rx_new(RX_OPTIONAL, atom, 0, 0, 0, 1);
+    }
+    if (c != '{') return atom;
+    p = rx_pattern + rx_parse_pos + 1;
+    minimum = 0;
+    maximum = 0;
+    digits = 0;
+    while (is_digit(*p)) {
+        digits = 1;
+        if (minimum < 1000) minimum = minimum * 10 + (*p - '0');
+        p++;
+    }
+    maximum = minimum;
+    if (*p == ',') {
+        p++;
+        if (!is_digit(*p)) maximum = -1;
+        else {
+            maximum = 0;
+            while (is_digit(*p)) {
+                if (maximum < 1000) maximum = maximum * 10 + (*p - '0');
+                p++;
+            }
+        }
+    }
+    if (!digits || *p != '}' ||
+        (maximum >= 0 && maximum < minimum) ||
+        minimum > MAX_RECORD || maximum > MAX_RECORD) {
+        rx_parse_error = 1;
+        return atom;
+    }
+    rx_parse_pos = (int)(p - rx_pattern) + 1;
+    return rx_new(RX_RANGE, atom, 0, 0, minimum, maximum);
+}
+
+static int rx_parse_sequence(void) {
+    int node, next;
+    if (rx_pattern[rx_parse_pos] == ')' ||
+        rx_pattern[rx_parse_pos] == '|' ||
+        rx_pattern[rx_parse_pos] == 0)
+        return rx_new(RX_EMPTY, 0, 0, 0, 0, 0);
+    node = rx_parse_repeat();
+    while (rx_pattern[rx_parse_pos] &&
+           rx_pattern[rx_parse_pos] != ')' &&
+           rx_pattern[rx_parse_pos] != '|') {
+        next = rx_parse_repeat();
+        node = rx_new(RX_SEQ, node, next, 0, 0, 0);
+    }
+    return node;
+}
+
+static int rx_parse_alt(void) {
+    int node, right;
+    node = rx_parse_sequence();
+    while (rx_pattern[rx_parse_pos] == '|') {
+        rx_parse_pos++;
+        right = rx_parse_sequence();
+        node = rx_new(RX_ALT, node, right, 0, 0, 0);
+    }
+    return node;
+}
+
+static int rx_emit(int op, int x, int y, int value) {
+    int i;
+    if (rx_code_count >= MAX_RX_CODE) {
+        rx_parse_error = 1;
+        return 0;
+    }
+    i = rx_code_count++;
+    rx_code[i].op = op;
+    rx_code[i].x = x;
+    rx_code[i].y = y;
+    rx_code[i].value = value;
+    return i;
+}
+
+static int rx_emit_node(int node, int next);
+
+static int rx_emit_star(int child, int next) {
+    int split = rx_emit(RXI_SPLIT, 0, next, 0);
+    int start = rx_emit_node(child, split);
+    rx_code[split].x = start;
+    return split;
+}
+
+static int rx_emit_optional(int child, int next) {
+    int split = rx_emit(RXI_SPLIT, 0, next, 0);
+    rx_code[split].x = rx_emit_node(child, next);
+    return split;
+}
+
+static int rx_emit_node(int node, int next) {
+    RxNode *n = &rx_nodes[node];
+    int start, end, i;
+    switch (n->kind) {
+    case RX_EMPTY:
+        return next;
+    case RX_CHAR:
+        return rx_emit(RXI_CHAR, next, 0, n->value);
+    case RX_ANY:
+        return rx_emit(RXI_ANY, next, 0, 0);
+    case RX_CLASS:
+        return rx_emit(RXI_CLASS, next, 0, n->value);
+    case RX_BOL:
+        return rx_emit(RXI_BOL, next, 0, 0);
+    case RX_EOL:
+        return rx_emit(RXI_EOL, next, 0, 0);
+    case RX_BACKREF:
+        return rx_emit(RXI_BACKREF, next, 0, n->value);
+    case RX_SEQ:
+        start = rx_emit_node(n->right, next);
+        return rx_emit_node(n->left, start);
+    case RX_ALT:
+        start = rx_emit_node(n->left, next);
+        end = rx_emit_node(n->right, next);
+        return rx_emit(RXI_SPLIT, start, end, 0);
+    case RX_GROUP:
+        end = rx_emit(RXI_SAVE_END, next, 0, n->value);
+        start = rx_emit_node(n->left, end);
+        return rx_emit(RXI_SAVE_START, start, 0, n->value);
+    case RX_STAR:
+        return rx_emit_star(n->left, next);
+    case RX_PLUS:
+        end = rx_emit(RXI_SPLIT, 0, next, 0);
+        start = rx_emit_node(n->left, end);
+        rx_code[end].x = start;
+        return start;
+    case RX_OPTIONAL:
+        return rx_emit_optional(n->left, next);
+    case RX_RANGE:
+        start = next;
+        if (n->maximum < 0) start = rx_emit_star(n->left, start);
+        else {
+            for (i = n->minimum; i < n->maximum; i++)
+                start = rx_emit_optional(n->left, start);
+        }
+        for (i = 0; i < n->minimum; i++)
+            start = rx_emit_node(n->left, start);
+        return start;
+    }
+    rx_parse_error = 1;
+    return next;
+}
+
+static int rx_caps_better(const RxState *state, int *best_start,
+                          int *best_end) {
+    int i, a, b;
+    for (i = 1; i <= rx_group_count; i++) {
+        a = state->start[i] < 0 ? 0 : state->end[i] - state->start[i] + 1;
+        b = best_start[i] < 0 ? 0 : best_end[i] - best_start[i] + 1;
+        if (a != b) return a > b;
+        if (state->start[i] >= 0 && best_start[i] >= 0 &&
+            state->start[i] != best_start[i])
+            return state->start[i] < best_start[i];
+    }
+    return 0;
+}
+
+static int rx_run(int start_pc, const char *text, int text_len, int start_pos,
+                  int *best_end, int *best_start, int *best_group_end) {
+    int top = 0, steps = 0, found = 0, i;
+    RxState state;
+    state.pc = start_pc;
+    state.pos = start_pos;
+    for (i = 0; i <= MAX_RX_GROUPS; i++) {
+        state.start[i] = -1;
+        state.end[i] = -1;
+    }
+    rx_stack[top++] = state;
+    while (top && steps++ < 50000) {
+        state = rx_stack[--top];
+        while (state.pc >= 0 && state.pc < rx_code_count) {
+            RxInstruction *ins = &rx_code[state.pc];
+            char c = state.pos < text_len ? text[state.pos] : 0;
+            int cap, length, j, match;
+            if (ins->op == RXI_CHAR) {
+                match = c && regex_equal(c, (char)ins->value);
+                if (!match) break;
+                state.pos++;
+                state.pc = ins->x;
+            } else if (ins->op == RXI_ANY) {
+                if (!c || c == '\n') break;
+                state.pos++;
+                state.pc = ins->x;
+            } else if (ins->op == RXI_CLASS) {
+                const char *classp = rx_pattern + ins->value;
+                if (!c || !regex_atom(&classp, c)) break;
+                state.pos++;
+                state.pc = ins->x;
+            } else if (ins->op == RXI_BOL) {
+                if (state.pos != 0) break;
+                state.pc = ins->x;
+            } else if (ins->op == RXI_EOL) {
+                if (state.pos != text_len) break;
+                state.pc = ins->x;
+            } else if (ins->op == RXI_SAVE_START) {
+                cap = ins->value;
+                state.start[cap] = state.pos;
+                state.end[cap] = -1;
+                state.pc = ins->x;
+            } else if (ins->op == RXI_SAVE_END) {
+                state.end[ins->value] = state.pos;
+                state.pc = ins->x;
+            } else if (ins->op == RXI_BACKREF) {
+                cap = ins->value;
+                if (cap > rx_group_count || state.start[cap] < 0 ||
+                    state.end[cap] < state.start[cap]) break;
+                length = state.end[cap] - state.start[cap];
+                if (state.pos + length > text_len) break;
+                for (j = 0; j < length; j++)
+                    if (!regex_equal(text[state.start[cap] + j],
+                                     text[state.pos + j])) break;
+                if (j != length) break;
+                state.pos += length;
+                state.pc = ins->x;
+            } else if (ins->op == RXI_SPLIT) {
+                if (top >= MAX_RX_STACK) {
+                    error_flag = 1;
+                    break;
+                }
+                rx_stack[top] = state;
+                rx_stack[top++].pc = ins->y;
+                state.pc = ins->x;
+            } else if (ins->op == RXI_MATCH) {
+                if (!found || state.pos > *best_end ||
+                    (state.pos == *best_end &&
+                     rx_caps_better(&state, best_start, best_group_end))) {
+                    found = 1;
+                    *best_end = state.pos;
+                    for (i = 0; i <= MAX_RX_GROUPS; i++) {
+                        best_start[i] = state.start[i];
+                        best_group_end[i] = state.end[i];
+                    }
+                }
+                break;
+            } else break;
+        }
+    }
+    if (steps >= 50000) error_flag = 1;
+    return found;
+}
+
+static int regex_span(const char *p, const char *s,
+                      int *start, int *length) {
+    int root, match_pc, start_pc, pos, best_end, found = 0;
+    int i, old_icase = regex_icase, ign = find_global("IGNORECASE", 0);
+    scopy(rx_pattern, p, MAX_STRING);
+    rx_parse_pos = 0;
+    rx_group_count = 0;
+    rx_node_count = 0;
+    rx_code_count = 0;
+    rx_parse_error = 0;
+    regex_icase = ign >= 0 && truth(globals[ign].value);
+    root = rx_parse_alt();
+    if (rx_pattern[rx_parse_pos] || rx_parse_error) {
+        regex_icase = old_icase;
+        error_flag = 1;
+        return 0;
+    }
+    match_pc = rx_emit(RXI_MATCH, -1, 0, 0);
+    start_pc = rx_emit_node(root, match_pc);
+    if (rx_parse_error) {
+        regex_icase = old_icase;
+        error_flag = 1;
+        return 0;
+    }
+    for (pos = 0; pos <= slen(s); pos++) {
+        best_end = -1;
+        for (i = 0; i <= MAX_RX_GROUPS; i++) {
+            rx_capture_start[i] = -1;
+            rx_capture_end[i] = -1;
+        }
+        if (rx_run(start_pc, s, slen(s), pos, &best_end,
+                   rx_capture_start, rx_capture_end)) {
+            found = 1;
+            *start = pos;
+            *length = best_end - pos;
+            break;
+        }
+        if (error_flag) break;
+    }
+    regex_icase = old_icase;
+    return found;
+}
+
+static int regex_match(const char *p, const char *s) {
+    int start, length;
+    return regex_span(p, s, &start, &length);
+}
+
 static int prec_start(int k) {
     return k == TOK_ID || k == TOK_NUM || k == TOK_STR || k == '$' ||
            k == '(' || k == '!';
 }
+
 static Value parse_expression(void);
 static Value parse_assignment(void);
 static Value parse_statement(int run);
+
+static int next_main_line(char *line) {
+    char filename[MAX_STRING], key[MAX_KEY];
+    Value arg;
+    int argc;
+    while (1) {
+        if (data_stream) {
+            if (fgets(line, MAX_RECORD, data_stream)) {
+                int n = slen(line);
+                while (n > 0 &&
+                       (line[n - 1] == '\n' || line[n - 1] == '\r'))
+                    line[--n] = 0;
+                nr++;
+                fnr++;
+                return 1;
+            }
+            fclose(data_stream);
+            data_stream = 0;
+        }
+        argc = (int)as_number(get_variable("ARGC"));
+        if (input_index < 1 || input_index >= argc) return 0;
+        sprintf(key, "%d", input_index++);
+        arg = get_element("ARGV", key, 0);
+        as_string(arg, filename);
+        if (!filename[0]) continue;
+        data_stream = fopen(filename, "r");
+        if (!data_stream) {
+            printf("CMSAWK: cannot open input %s\n", filename);
+            error_flag = 1;
+            return 0;
+        }
+        set_global("FILENAME", string_value(filename));
+        fnr = 0;
+    }
+}
+
 static int read_record(FILE *stream, int count_nr, int replace_zero,
                        int has_target, Value target) {
     char line[MAX_RECORD];
     int n;
-    if (!stream || !fgets(line, sizeof line, stream)) return 0;
-    n = slen(line);
-    while (n > 0 && (line[n - 1] == '\n' || line[n - 1] == '\r'))
-        line[--n] = 0;
-    if (count_nr) { nr++; fnr++; }
+    if (count_nr) {
+        if (!next_main_line(line)) return 0;
+    } else {
+        if (!stream || !fgets(line, sizeof line, stream)) return 0;
+        n = slen(line);
+        while (n > 0 && (line[n - 1] == '\n' || line[n - 1] == '\r'))
+            line[--n] = 0;
+    }
     if (replace_zero) {
         scopy(record, line, MAX_RECORD);
         record_length = slen(record);
@@ -1124,12 +1783,14 @@ static int read_record(FILE *stream, int count_nr, int replace_zero,
     }
     return 1;
 }
+
 static int find_function(const char *name) {
     int i;
     for (i = 0; i < function_count; i++)
         if (seq(functions[i].name, name)) return i;
     return -1;
 }
+
 static Value call_function(int fi, Value *args, int argc) {
     Value result = empty_value();
     ParserState resume;
@@ -1176,6 +1837,7 @@ static Value call_function(int fi, Value *args, int argc) {
     restore_parser(resume);
     return result;
 }
+
 static void clear_array(int aid) {
     int i;
     if (aid < 0 || aid >= array_count) return;
@@ -1183,6 +1845,7 @@ static void clear_array(int aid) {
         arrays[aid].item[i].used = 0;
     arrays[aid].count = 0;
 }
+
 static int array_from_value(Value v) {
     AwkVar *var;
     if (v.kind == V_ARRAY) return v.array_id;
@@ -1190,10 +1853,12 @@ static int array_from_value(Value v) {
     var = ref_var(v.ref_entry, v.ref_index);
     return var ? ensure_array(var) : -1;
 }
+
 static void set_global(const char *name, Value v) {
     int i = find_global(name, 1);
     if (i >= 0) globals[i].value = v;
 }
+
 static int split_into_array(const char *text, int aid, const char *sep) {
     int count = 0, i = 0, start, len, n;
     char key[MAX_KEY], part[MAX_STRING];
@@ -1277,19 +1942,23 @@ static int split_into_array(const char *text, int aid, const char *sep) {
     }
     return count;
 }
+
 static int case_lower(char c) {
     if ((c >= 'A' && c <= 'I') || (c >= 'J' && c <= 'R') ||
         (c >= 'S' && c <= 'Z')) return c + ('a' - 'A');
     return c;
 }
+
 static int case_upper(char c) {
     if ((c >= 'a' && c <= 'i') || (c >= 'j' && c <= 'r') ||
         (c >= 's' && c <= 'z')) return c + ('A' - 'a');
     return c;
 }
+
 static double abs_double(double x) {
     return x < 0 ? -x : x;
 }
+
 static double sqrt_approx(double x) {
     double guess;
     int i;
@@ -1299,6 +1968,7 @@ static double sqrt_approx(double x) {
     for (i = 0; i < 32; i++) guess = (guess + x / guess) / 2;
     return guess;
 }
+
 static double exp_approx(double x) {
     double term = 1, sum = 1;
     int i, scale = 0;
@@ -1315,6 +1985,7 @@ static double exp_approx(double x) {
     while (scale-- > 0) sum *= sum;
     return sum;
 }
+
 static double log_approx(double x) {
     double z, z2, term, sum;
     int scale = 0, i;
@@ -1331,6 +2002,7 @@ static double log_approx(double x) {
     }
     return 2 * sum + scale * 0.6931471805599453;
 }
+
 static double atan_small(double x) {
     double term = x, sum = x, x2 = x * x;
     int i, sign = -1;
@@ -1341,6 +2013,7 @@ static double atan_small(double x) {
     }
     return sum;
 }
+
 static double atan_approx(double x) {
     double sign = 1;
     if (x < 0) { sign = -1; x = -x; }
@@ -1351,6 +2024,7 @@ static double atan_approx(double x) {
                        atan_small((x - 1) / (x + 1)));
     return sign * atan_small(x);
 }
+
 static double atan2_approx(double y, double x) {
     if (x > 0) return atan_approx(y / x);
     if (x < 0 && y >= 0) return atan_approx(y / x) + 3.1415926535897932;
@@ -1359,6 +2033,7 @@ static double atan2_approx(double y, double x) {
     if (y < 0) return -1.5707963267948966;
     return 0;
 }
+
 static double sin_approx(double x) {
     double term, sum, x2;
     int i, n;
@@ -1373,6 +2048,7 @@ static double sin_approx(double x) {
     }
     return sum;
 }
+
 static int substitute_value(const char *pattern, const char *replacement,
                             Value target, int global, int use_current) {
     char input[MAX_STRING], repl[MAX_STRING], output[MAX_STRING];
@@ -1412,6 +2088,7 @@ static int substitute_value(const char *pattern, const char *replacement,
     }
     return count;
 }
+
 static void set_array_string(int aid, int index, const char *text) {
     char key[MAX_KEY];
     int entry;
@@ -1419,58 +2096,31 @@ static void set_array_string(int aid, int index, const char *text) {
     entry = array_item(aid, key, 1);
     if (entry >= 0) arrays[aid].item[entry].value = string_value(text);
 }
-static void match_captures(const char *pattern, const char *matched,
-                           int aid) {
-    int i = 0, group = 0, cursor = 0, escaped = 0, in_class = 0;
-    char value[MAX_STRING], body[MAX_STRING];
-    int matched_len = slen(matched);
+
+static void match_captures(const char *text, int match_start,
+                           int match_length, int aid) {
+    int group, start, end, i;
+    char value[MAX_STRING];
     clear_array(aid);
-    set_array_string(aid, 0, matched);
-    while (pattern[i]) {
-        int open, close, depth, j, start, length, nested;
-        if (escaped) { escaped = 0; i++; continue; }
-        if (pattern[i] == '\\') { escaped = 1; i++; continue; }
-        if (pattern[i] == '[') { in_class = 1; i++; continue; }
-        if (pattern[i] == ']' && in_class) { in_class = 0; i++; continue; }
-        if (in_class || pattern[i] != '(') { i++; continue; }
-        open = i++;
-        close = -1;
-        depth = 1;
-        nested = 0;
-        escaped = 0;
-        in_class = 0;
-        while (pattern[i] && depth) {
-            if (escaped) { escaped = 0; i++; continue; }
-            if (pattern[i] == '\\') { escaped = 1; i++; continue; }
-            if (pattern[i] == '[') { in_class = 1; i++; continue; }
-            if (pattern[i] == ']' && in_class) { in_class = 0; i++; continue; }
-            if (!in_class && pattern[i] == '(') {
-                depth++;
-                nested = 1;
-            } else if (!in_class && pattern[i] == ')' && --depth == 0)
-                close = i;
-            i++;
+    for (i = 0; i < match_length && i < MAX_STRING - 1; i++)
+        value[i] = text[match_start + i];
+    value[i] = 0;
+    set_array_string(aid, 0, value);
+    for (group = 1; group <= rx_group_count; group++) {
+        start = rx_capture_start[group];
+        end = rx_capture_end[group];
+        if (start < match_start || end < start ||
+            end > match_start + match_length) {
+            set_array_string(aid, group, "");
+            continue;
         }
-        if (close < 0) break;
-        group++;
-        if (!nested) {
-            int n = close - open - 1;
-            if (n >= MAX_STRING) n = MAX_STRING - 1;
-            for (j = 0; j < n; j++) body[j] = pattern[open + 1 + j];
-            body[n] = 0;
-            if (cursor <= matched_len &&
-                regex_span(body, matched + cursor, &start, &length)) {
-                int k;
-                cursor += start;
-                if (length >= MAX_STRING) length = MAX_STRING - 1;
-                for (k = 0; k < length; k++) value[k] = matched[cursor + k];
-                value[length] = 0;
-                set_array_string(aid, group, value);
-                cursor += length;
-            } else set_array_string(aid, group, "");
-        } else set_array_string(aid, group, "");
+        for (i = 0; start + i < end && i < MAX_STRING - 1; i++)
+            value[i] = text[start + i];
+        value[i] = 0;
+        set_array_string(aid, group, value);
     }
 }
+
 static Value call_builtin(const char *name, Value *args, int argc) {
     Value v = empty_value();
     char text[MAX_STRING], other[MAX_STRING];
@@ -1548,14 +2198,7 @@ static Value call_builtin(const char *name, Value *args, int argc) {
             set_global("RLENGTH", number_value(length));
             if (argc >= 3) {
                 int aid = array_from_value(args[2]);
-                if (aid >= 0) {
-                    char match[MAX_STRING];
-                    int i;
-                    for (i = 0; i < length && i < MAX_STRING - 1; i++)
-                        match[i] = text[start + i];
-                    match[i] = 0;
-                    match_captures(other, match, aid);
-                }
+                if (aid >= 0) match_captures(text, start, length, aid);
             }
             return number_value(start + 1);
         }
@@ -1622,6 +2265,7 @@ static Value call_builtin(const char *name, Value *args, int argc) {
     }
     return v;
 }
+
 static Value parse_primary(void) {
     Value v = empty_value();
     if (token.kind == TOK_NUM) {
@@ -1771,6 +2415,7 @@ static Value parse_primary(void) {
     if (token.kind) lex_next();
     return v;
 }
+
 static Value parse_unary(void) {
     Value v;
     int op = token.kind;
@@ -1803,6 +2448,7 @@ static Value parse_unary(void) {
     }
     return v;
 }
+
 static Value parse_multiply(void) {
     Value a = parse_unary(), b;
     int op;
@@ -1821,6 +2467,7 @@ static Value parse_multiply(void) {
     }
     return a;
 }
+
 static Value parse_add(void) {
     Value a = parse_multiply(), b;
     int op;
@@ -1834,6 +2481,7 @@ static Value parse_add(void) {
     }
     return a;
 }
+
 static Value parse_concat(void) {
     Value a = parse_add(), b;
     char left[MAX_STRING], right[MAX_STRING], joined[MAX_STRING];
@@ -1851,6 +2499,7 @@ static Value parse_concat(void) {
     }
     return a;
 }
+
 static int compare_values(Value a, Value b) {
     char x[MAX_STRING], y[MAX_STRING];
     double nx, ny;
@@ -1866,6 +2515,12 @@ static int compare_values(Value a, Value b) {
         return x[i] == y[i] ? 0 : (x[i] < y[i] ? -1 : 1);
     }
 }
+
+static void pipe_unavailable(void) {
+    puts("CMSAWK: command pipes need POPEN/PCLOSE; PDPCLIB lacks them");
+    error_flag = 1;
+}
+
 static Value parse_compare(void) {
     Value a = parse_concat(), b;
     int op, cmp;
@@ -1873,10 +2528,21 @@ static Value parse_compare(void) {
            token.kind == '<' || token.kind == '>' ||
            token.kind == TOK_LE || token.kind == TOK_GE ||
            token.kind == TOK_MATCH || token.kind == TOK_NMATCH ||
-           token.kind == TOK_IN) {
-        if (print_context && token.kind == '>') break;
+           token.kind == TOK_IN || token.kind == '|') {
+        if (print_context &&
+            (token.kind == '>' || token.kind == '|')) break;
         op = token.kind;
         lex_next();
+        if (op == '|') {
+            if (token.kind != TOK_ID || !seq(token.text, "getline")) {
+                error_flag = 1;
+                return number_value(0);
+            }
+            lex_next();
+            if (token.kind == TOK_ID || token.kind == '$') parse_primary();
+            if (execute_enabled) pipe_unavailable();
+            return number_value(-1);
+        }
         b = parse_concat();
         if (op == TOK_IN) {
             char key[MAX_KEY];
@@ -1902,6 +2568,7 @@ static Value parse_compare(void) {
     }
     return a;
 }
+
 static Value parse_and(void) {
     Value a = parse_compare(), b;
     while (accept(TOK_AND)) {
@@ -1913,6 +2580,7 @@ static Value parse_and(void) {
     }
     return a;
 }
+
 static Value parse_or(void) {
     Value a = parse_and(), b;
     while (accept(TOK_OR)) {
@@ -1924,6 +2592,7 @@ static Value parse_or(void) {
     }
     return a;
 }
+
 static Value parse_conditional(void) {
     Value a = parse_or(), b, c;
     if (accept('?')) {
@@ -1939,6 +2608,7 @@ static Value parse_conditional(void) {
     }
     return a;
 }
+
 static Value parse_assignment(void) {
     Value left = parse_conditional(), right;
     int op = token.kind;
@@ -1973,10 +2643,13 @@ static Value parse_assignment(void) {
     }
     return right;
 }
+
 static Value parse_expression(void) {
     return parse_assignment();
 }
+
 static int find_statement_end(int start);
+
 static int append_output(char *out, int used, int cap, const char *text) {
     int i = 0;
     while (text[i] && used + i < cap - 1) {
@@ -1986,6 +2659,7 @@ static int append_output(char *out, int used, int cap, const char *text) {
     out[used + i] = 0;
     return used + i;
 }
+
 static void format_output(const char *fmt, Value *args, int argc,
                           char *out, int cap) {
     int i = 0, used = 0, ai = 0, n, j;
@@ -2050,10 +2724,12 @@ static void format_output(const char *fmt, Value *args, int argc,
         }
     }
 }
+
 static void write_text(FILE *dest, const char *text) {
     if (dest) fputs(text, dest);
     else printf("%s", text);
 }
+
 static FILE *parse_output_target(int run) {
     Value name_value;
     char name[MAX_STRING];
@@ -2071,11 +2747,13 @@ static FILE *parse_output_target(int run) {
     }
     return dest;
 }
+
 static void print_value(Value v, FILE *dest) {
     char text[MAX_STRING];
     as_string(v, text);
     write_text(dest, text);
 }
+
 static void print_statement(int run, int formatted) {
     Value args[MAX_PARAMS];
     int argc = 0, i, old_context = print_context;
@@ -2128,6 +2806,14 @@ static void print_statement(int run, int formatted) {
     } else {
         args[argc++] = field_value(0);
     }
+    if (token.kind == '|') {
+        lex_next();
+        print_context = 0;
+        parse_assignment();
+        if (run) pipe_unavailable();
+        print_context = old_context;
+        return;
+    }
     dest = parse_output_target(run);
     if (run) {
         int oi = find_global("OFS", 0);
@@ -2147,6 +2833,7 @@ static void print_statement(int run, int formatted) {
     }
     print_context = old_context;
 }
+
 static void skip_balanced(int left, int right) {
     int depth = 1;
     lex_next();
@@ -2156,6 +2843,7 @@ static void skip_balanced(int left, int right) {
         lex_next();
     }
 }
+
 static void skip_to_delimiter(int delimiter) {
     int parens = 0, brackets = 0;
     while (token.kind) {
@@ -2167,6 +2855,7 @@ static void skip_to_delimiter(int delimiter) {
         lex_next();
     }
 }
+
 static int find_statement_end(int start) {
     ParserState saved = save_parser();
     int end, body_end;
@@ -2182,6 +2871,7 @@ static int find_statement_end(int start) {
         set_parser(body_end);
         if (token.kind == TOK_ID && seq(token.text, "else")) {
             lex_next();
+            skip_semis();
             end = find_statement_end(token.start);
         } else end = body_end;
     } else if (token.kind == TOK_ID &&
@@ -2192,8 +2882,10 @@ static int find_statement_end(int start) {
         end = find_statement_end(token.start);
     } else if (token.kind == TOK_ID && seq(token.text, "do")) {
         lex_next();
+        skip_semis();
         body_end = find_statement_end(token.start);
         set_parser(body_end);
+        skip_semis();
         if (token.kind == TOK_ID && seq(token.text, "while")) {
             lex_next();
             if (token.kind == '(') skip_balanced('(', ')');
@@ -2211,6 +2903,7 @@ static int find_statement_end(int start) {
     restore_parser(saved);
     return end;
 }
+
 static Value parse_statement_impl(int run) {
     Value result = empty_value();
     int loop_end, cond_pos, inc_pos, body_start;
@@ -2243,6 +2936,7 @@ static Value parse_statement_impl(int run) {
         skip_semis();
         if (token.kind == TOK_ID && seq(token.text, "else")) {
             lex_next();
+            skip_semis();
             parse_statement(run && !cond && flow_state == FLOW_NONE);
         }
         return result;
@@ -2276,6 +2970,7 @@ static Value parse_statement_impl(int run) {
     }
     if (token.kind == TOK_ID && seq(token.text, "do")) {
         lex_next();
+        skip_semis();
         body_start = token.start;
         loop_end = find_statement_end(body_start);
         loop = 0;
@@ -2465,6 +3160,7 @@ static Value parse_statement_impl(int run) {
     result = parse_expression();
     return result;
 }
+
 static Value parse_statement(int run) {
     int old_enabled = execute_enabled;
     Value result;
@@ -2473,6 +3169,7 @@ static Value parse_statement(int run) {
     execute_enabled = old_enabled;
     return result;
 }
+
 static int load_program(const char *fileid) {
     FILE *f;
     char line[MAX_RECORD];
@@ -2490,8 +3187,10 @@ static int load_program(const char *fileid) {
         if (!n || line[n - 1] != '\n') source[source_length++] = '\n';
     }
     source[source_length] = 0;
+    classify_newlines();
     return fclose(f) == 0;
 }
+
 static int parse_function(void) {
     AwkFunction *fn;
     char name[MAX_STRING];
@@ -2525,6 +3224,7 @@ static int parse_function(void) {
     skip_semis();
     return 1;
 }
+
 static int parse_rule_source(void) {
     AwkRule *r;
     int body_start, body_end, start, p, escaped, old_enabled;
@@ -2579,6 +3279,7 @@ static int parse_rule_source(void) {
     skip_semis();
     return 1;
 }
+
 static int parse_program(void) {
     set_parser(0);
     rule_count = 0;
@@ -2594,6 +3295,7 @@ static int parse_program(void) {
     }
     return !error_flag;
 }
+
 static int rule_matches(const AwkRule *r) {
     Value v;
     ParserState saved;
@@ -2608,11 +3310,13 @@ static int rule_matches(const AwkRule *r) {
     restore_parser(saved);
     return yes;
 }
+
 static int execute_rule(const AwkRule *r) {
     set_parser(r->body_start);
     parse_statement(1);
     return !error_flag;
 }
+
 static int make_file_id(char *out, const char *fn,
                         const char *ft, const char *fm) {
     int i = 0;
@@ -2624,16 +3328,22 @@ static int make_file_id(char *out, const char *fn,
     out[i] = 0;
     return i;
 }
+
 int main(int argc, char **argv) {
-    char script_id[32], data_id[32];
-    FILE *data;
-    int i, run_data;
-    if (argc != 7) {
-        puts("Usage: CMSAWK scriptFN scriptFT scriptFM dataFN dataFT dataFM");
+    char script_id[32], input_id[32], line[MAX_RECORD];
+    AwkVar *argv_var;
+    int i, run_data, data_count, argv_index, arg_index;
+    if (argc < 7 || (argc - 4) % 3 != 0) {
+        puts("Usage: CMSAWK scriptFN scriptFT scriptFM"
+             " dataFN dataFT dataFM ...");
         return 4;
     }
     make_file_id(script_id, argv[1], argv[2], argv[3]);
-    make_file_id(data_id, argv[4], argv[5], argv[6]);
+    data_count = (argc - 4) / 3;
+    if (data_count > MAX_INPUT_FILES) {
+        puts("CMSAWK: too many input files");
+        return 4;
+    }
     if (!load_program(script_id)) {
         puts("CMSAWK: cannot read script or script too large");
         return 8;
@@ -2650,14 +3360,25 @@ int main(int argc, char **argv) {
     fnr = 0;
     nf = 0;
     error_flag = 0;
-    set_global("FILENAME", string_value(data_id));
-    run_data = 1;
-    data = fopen(data_id, "r");
-    if (!data) {
-        puts("CMSAWK: cannot open data file");
-        return 8;
+    input_index = 1;
+    {
+        int vi = find_global("ARGV", 1);
+        if (vi < 0) return 8;
+        argv_var = &globals[vi];
+        argv_var->array_id = new_array();
+        argv_index = argv_var->array_id;
     }
-    data_stream = data;
+    set_global("ARGC", number_value(data_count + 1));
+    set_array_string(argv_index, 0, "CMSAWK");
+    for (i = 0; i < data_count; i++) {
+        arg_index = 4 + i * 3;
+        make_file_id(input_id, argv[arg_index], argv[arg_index + 1],
+                     argv[arg_index + 2]);
+        set_array_string(argv_index, i + 1, input_id);
+    }
+    set_global("FILENAME", string_value(""));
+    run_data = 1;
+    data_stream = 0;
     for (i = 0; i < rule_count; i++) {
         if (rules[i].kind == RULE_BEGIN) {
             flow_state = FLOW_NONE;
@@ -2673,18 +3394,13 @@ int main(int argc, char **argv) {
         }
     }
     if (run_data && !error_flag) {
-        while (fgets(record, sizeof record, data)) {
+        while (next_main_line(line)) {
+            scopy(record, line, MAX_RECORD);
             record_length = slen(record);
-            while (record_length > 0 &&
-                   (record[record_length - 1] == '\n' ||
-                    record[record_length - 1] == '\r'))
-                record[--record_length] = 0;
             if (record_length >= MAX_RECORD - 1) {
                 error_flag = 1;
                 break;
             }
-            nr++;
-            fnr++;
             split_fields();
             flow_state = FLOW_NONE;
             for (i = 0; i < rule_count; i++) {
@@ -2706,7 +3422,7 @@ int main(int argc, char **argv) {
             if (error_flag) break;
         }
     }
-    fclose(data);
+    if (data_stream) fclose(data_stream);
     data_stream = 0;
     for (i = 0; i < rule_count; i++) {
         if (rules[i].kind == RULE_END) {
