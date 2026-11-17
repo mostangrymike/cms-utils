@@ -1,5 +1,6 @@
-/* CMSAWK 0.6: C89 AWK interpreter for GCCCMS/PDPCLIB. */
-/* Adds ARGV input lists, nested ERE captures and numeric backreferences. */
+/* CMSAWK 0.7: C89 AWK interpreter for GCCCMS/PDPCLIB. */
+/* Adds exponentiation and regex literals in expression position. */
+/* printf numeric zero padding is supplied when PDPCLIB omits it. */
 /* Command pipes require POPEN/PCLOSE, absent from this PDPCLIB runtime. */
 /* Fixed tables and strings are bounded for CMS memory. */
 typedef struct cms_file FILE;
@@ -2283,6 +2284,24 @@ static Value parse_primary(void) {
         lex_next();
         return v;
     }
+    if (token.kind == '/') {
+        int p = token.start + 1, escaped = 0;
+        int start = p;
+        while (p < source_length) {
+            char c = source[p++];
+            if (!escaped && c == '/') break;
+            if (escaped) escaped = 0;
+            else if (c == '\\') escaped = 1;
+        }
+        if (p > source_length || source[p - 1] != '/') {
+            error_flag = 1;
+            return empty_value();
+        }
+        token_text(&token, source + start, p - start - 1);
+        v = string_value(token.text);
+        set_parser(p);
+        return v;
+    }
     if (accept('(')) {
         int old_context = print_context;
         print_context = 0;
@@ -2416,6 +2435,8 @@ static Value parse_primary(void) {
     return v;
 }
 
+static Value parse_power(void);
+
 static Value parse_unary(void) {
     Value v;
     int op = token.kind;
@@ -2436,7 +2457,7 @@ static Value parse_unary(void) {
         if (op == '-') return number_value(-as_number(v));
         return number_value(as_number(v));
     }
-    v = parse_primary();
+    v = parse_power();
     if (token.kind == TOK_INC || token.kind == TOK_DEC) {
         int inc = token.kind == TOK_INC;
         double n = as_number(v);
@@ -2447,6 +2468,37 @@ static Value parse_unary(void) {
         return number_value(n);
     }
     return v;
+}
+
+static Value parse_power(void) {
+    Value a = parse_primary(), b;
+    if (token.kind == TOK_INC || token.kind == TOK_DEC) {
+        int inc = token.kind == TOK_INC;
+        double n = as_number(a);
+        lex_next();
+        if (!a.ref_kind) error_flag = 1;
+        else if (execute_enabled)
+            assign_ref(a, number_value(n + (inc ? 1 : -1)));
+        a = number_value(n);
+    }
+    if (accept('^')) {
+        b = parse_unary();
+        if (as_number(a) == 0 && as_number(b) < 0) error_flag = 1;
+        else if (as_number(a) < 0 &&
+                 (long)as_number(b) != as_number(b)) error_flag = 1;
+        else {
+            double x = as_number(a), y = as_number(b);
+            if (x < 0) {
+                long n = (long)y, i;
+                double result = 1;
+                for (i = 0; i < (n < 0 ? -n : n); i++) result *= -x;
+                a = number_value(n < 0 ? 1 / result : result);
+                if (n % 2) a.number = -a.number;
+            } else if (x == 0) a = number_value(y == 0 ? 1 : 0);
+            else a = number_value(exp_approx(y * log_approx(x)));
+        }
+    }
+    return a;
 }
 
 static Value parse_multiply(void) {
@@ -2662,7 +2714,7 @@ static int append_output(char *out, int used, int cap, const char *text) {
 
 static void format_output(const char *fmt, Value *args, int argc,
                           char *out, int cap) {
-    int i = 0, used = 0, ai = 0, n, j;
+    int i = 0, used = 0, ai = 0, n, j, width, zero_flag;
     char spec[32], temp[256], text[MAX_STRING];
     char c;
     out[0] = 0;
@@ -2711,6 +2763,17 @@ static void format_output(const char *fmt, Value *args, int argc,
                 else sprintf(temp, spec, (int)as_number(args[ai]));
             } else {
                 sprintf(temp, spec, as_number(args[ai]));
+            }
+            zero_flag = 0;
+            width = 0;
+            for (j = 1; j < n && spec[j] != '.'; j++) {
+                if (spec[j] == '0' && width == 0) zero_flag = 1;
+                else if (is_digit(spec[j])) width = width * 10 +
+                                                   spec[j] - '0';
+            }
+            if (zero_flag && c != 's' && c != 'c') {
+                int first = temp[0] == '-' || temp[0] == '+' ? 1 : 0;
+                while (temp[first] == ' ') temp[first++] = '0';
             }
             ai++;
             used = append_output(out, used, cap, temp);
