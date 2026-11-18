@@ -1528,9 +1528,6 @@ static void write_newline(void) {
 
 static void emit_text(const char *text, int terminated) {
     const char *p = text;
-    int ended_newline = 0;
-    int len = text_length(text);
-    if (len > 0 && text[len - 1] == '\n') ended_newline = 1;
     if (nul_mode) {
         write_text(text);
         if (terminated) write_char(record_sep);
@@ -1556,7 +1553,7 @@ static void emit_text(const char *text, int terminated) {
         }
         break;
     }
-    if (terminated && !ended_newline) write_newline();
+    if (terminated) write_newline();
 }
 
 static void output_record(const char *line, int terminated) {
