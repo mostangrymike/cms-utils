@@ -2022,15 +2022,17 @@ static int execute_cycle(char *pattern, int *terminated) {
             break;
         case CMD_EXEC: {
             char executed[MAX_RECORD];
-            const char *command_text =
-                command->text[0] ? command->text : pattern;
             if (sandbox_mode) {
                 puts("sed: e/r/w commands disabled in sandbox mode");
                 error_flag = 1;
                 return 0;
             }
-            if (host_exec_text(command_text, executed, MAX_RECORD))
-                emit_text(executed, 1);
+            if (command->text[0]) {
+                if (host_exec_text(command->text, executed, MAX_RECORD))
+                    emit_text(executed, 1);
+            } else if (host_exec_text(pattern, executed, MAX_RECORD)) {
+                text_copy(pattern, executed, MAX_RECORD);
+            }
             break;
         }
         default:
