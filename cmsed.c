@@ -118,6 +118,7 @@ static int rx_multiline;
 static int list_width = 70;
 static int sandbox_mode;
 static int posix_mode;
+static int script_read_error;
 #define GNU_BRE (!posix_mode || ere_mode)
 
 static char input_ids[MAX_INPUT_FILES][MAX_STRING];
@@ -1498,7 +1499,10 @@ static int load_script_stream(FILE *script) {
 static int load_script(const char *fileid) {
     FILE *script = fopen(fileid, "r");
     int ok;
-    if (!script) return 0;
+    if (!script) {
+        script_read_error = 1;
+        return 0;
+    }
     ok = load_script_stream(script);
     if (fclose(script) != 0) ok = 0;
     return ok;
@@ -1691,6 +1695,7 @@ static int prepare_write_files(void) {
                 (command->kind == CMD_SUBSTITUTE &&
                  command->sub_write_name[0])) {
                 puts("sed: e/r/w commands disabled in sandbox mode");
+                exit_status = 1;
                 return 0;
             }
         }
@@ -1974,7 +1979,7 @@ static int execute_cycle(char *pattern, int *terminated) {
                     char executed[MAX_RECORD];
                     if (sandbox_mode) {
                         puts("sed: e/r/w commands disabled in sandbox mode");
-                        error_flag = 1;
+                        exit_status = 1;
                         return 0;
                     }
                     if (host_exec_text(pattern, executed, MAX_RECORD))
@@ -2033,7 +2038,7 @@ static int execute_cycle(char *pattern, int *terminated) {
         case CMD_READ_FILE:
             if (sandbox_mode) {
                 puts("sed: e/r/w commands disabled in sandbox mode");
-                error_flag = 1;
+                exit_status = 1;
                 return 0;
             }
             appended_used = append_file_text(appended, appended_used,
@@ -2046,7 +2051,7 @@ static int execute_cycle(char *pattern, int *terminated) {
         case CMD_READ_LINE:
             if (sandbox_mode) {
                 puts("sed: e/r/w commands disabled in sandbox mode");
-                error_flag = 1;
+                exit_status = 1;
                 return 0;
             }
             appended_used = append_read_line(appended, appended_used,
@@ -2163,7 +2168,7 @@ static int execute_cycle(char *pattern, int *terminated) {
             char executed[MAX_RECORD];
             if (sandbox_mode) {
                 puts("sed: e/r/w commands disabled in sandbox mode");
-                error_flag = 1;
+                exit_status = 1;
                 return 0;
             }
             if (command->text[0]) {
@@ -2452,7 +2457,7 @@ static int host_in_place(const char *path, const char *suffix) {
 
 static int usage(void) {
     puts("Usage: sed [-nrszuE] [-e command] [-f script] [script] [file ...]");
-    return 4;
+    return 1;
 }
 
 static void print_help(void) {
@@ -2518,31 +2523,31 @@ static int host_main(int argc, char **argv) {
         } else if (!strncmp(argv[arg], "--expression=", 13)) {
             if (!load_script_string(argv[arg] + 13)) {
                 puts("sed: invalid -e script");
-                return 4;
+                return 1;
             }
             have_script = 1;
             arg++;
         } else if (!strcmp(argv[arg], "--expression")) {
             if (++arg >= argc || !load_script_string(argv[arg])) {
                 puts("sed: invalid -e script");
-                return 4;
+                return 1;
             }
             have_script = 1;
             arg++;
         } else if (!strncmp(argv[arg], "--file=", 7)) {
             if (!load_script(argv[arg] + 7)) {
                 puts("sed: cannot read -f script");
-                return 4;
+                return script_read_error ? 4 : 1;
             }
             have_script = 1;
             arg++;
         } else if (!strcmp(argv[arg], "--file")) {
             if (++arg >= argc) return usage();
             if (!strcmp(argv[arg], "-")) {
-                if (!load_script_stream(stdin)) return 4;
+                if (!load_script_stream(stdin)) return 1;
             } else if (!load_script(argv[arg])) {
                 puts("sed: cannot read -f script");
-                return 4;
+                return script_read_error ? 4 : 1;
             }
             have_script = 1;
             arg++;
@@ -2603,29 +2608,36 @@ static int host_main(int argc, char **argv) {
         } else if (!strcmp(argv[arg], "-e")) {
             if (++arg >= argc || !load_script_string(argv[arg])) {
                 puts("sed: invalid -e script");
-                return 4;
+                return 1;
             }
             have_script = 1;
             arg++;
         } else if (!strcmp(argv[arg], "-f")) {
             if (++arg >= argc) return usage();
             if (!strcmp(argv[arg], "-")) {
-                if (!load_script_stream(stdin)) return 4;
+                if (!load_script_stream(stdin)) return 1;
             } else if (!load_script(argv[arg])) {
                 puts("sed: cannot read -f script");
-                return 4;
+                return script_read_error ? 4 : 1;
             }
             have_script = 1;
             arg++;
         } else {
             printf("sed: unsupported option %s\n", argv[arg]);
-            return 4;
+            return 1;
         }
     }
     if (!have_script) {
-        if (arg >= argc || !load_script(argv[arg++])) {
+        if (arg >= argc) {
             puts("sed: no script supplied");
-            return 4;
+            return 1;
+        }
+        if (!load_script(argv[arg++])) {
+            if (script_read_error) {
+                puts("sed: cannot read script");
+                return 4;
+            }
+            return 1;
         }
     }
     while (arg < argc) {
@@ -2654,8 +2666,8 @@ static int host_main(int argc, char **argv) {
                 return 4;
             }
             if (!count_file_records(files[i], &file_counts[i])) {
-                printf("sed: cannot count input %s\n", files[i]);
-                return 8;
+                printf("sed: cannot read %s\n", files[i]);
+                return 2;
             }
         }
     } else {
@@ -2663,8 +2675,8 @@ static int host_main(int argc, char **argv) {
         for (i = 0; i < file_count; i++) {
             if (!strcmp(files[i], "-")) continue;
             if (!count_file_records(files[i], &file_counts[i])) {
-                printf("sed: cannot count input %s\n", files[i]);
-                return 8;
+                printf("sed: cannot read %s\n", files[i]);
+                return 2;
             }
             sum += file_counts[i];
         }
@@ -2710,7 +2722,7 @@ static int host_main(int argc, char **argv) {
     if (!prepare_write_files()) {
         close_write_files();
         if (spool) fclose(spool);
-        return 4;
+        return exit_status ? exit_status : 4;
     }
     if (!in_place) {
         if (!run_all()) {
@@ -2819,7 +2831,7 @@ int main(int argc, char **argv) {
         } else if (argv[arg][1] == 'e' && !argv[arg][2]) {
             if (++arg >= argc || !load_script_string(argv[arg])) {
                 puts("sed: invalid -e script");
-                return 4;
+                return 1;
             }
             have_script = 1;
             arg++;
@@ -2829,13 +2841,13 @@ int main(int argc, char **argv) {
                          argv[arg + 3]);
             if (!load_script(script_id)) {
                 printf("sed: cannot read script %s\n", script_id);
-                return 8;
+                return script_read_error ? 4 : 1;
             }
             have_script = 1;
             arg += 4;
         } else {
             printf("sed: unsupported option %s\n", argv[arg]);
-            return 4;
+            return 1;
         }
     }
     if (!have_script) {
@@ -2843,13 +2855,13 @@ int main(int argc, char **argv) {
         make_file_id(script_id, argv[arg], argv[arg + 1], argv[arg + 2]);
         if (!load_script(script_id)) {
             puts("sed: cannot read script");
-            return 8;
+            return script_read_error ? 4 : 1;
         }
         arg += 3;
     }
     if ((argc - arg) < 3 || (argc - arg) % 3 != 0) {
         puts("sed: input file ids must be fn ft fm triples");
-        return 4;
+        return 1;
     }
     input_count = (argc - arg) / 3;
     if (input_count > MAX_INPUT_FILES) {
@@ -2891,7 +2903,7 @@ int main(int argc, char **argv) {
     }
     if (!prepare_write_files()) {
         close_write_files();
-        return 4;
+        return exit_status ? exit_status : 4;
     }
     if (!in_place) {
         if (!run_all()) {
