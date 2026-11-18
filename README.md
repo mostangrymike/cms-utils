@@ -1,4 +1,4 @@
-# CMSED 0.3
+# CMSED 0.4
 
 CMSED is a C89 stream editor for CMS records with a host build for ordinary
 paths and standard input. It follows POSIX sed and the common GNU extensions,
@@ -39,8 +39,9 @@ backup.
 
 ## Options
 
-`-n`, `-s`, `-z`, `-E`/`-r`, `-e`, `-f -`, `-i[SUFFIX]`, `-u`, `--posix`,
-`--sandbox`, `--follow-symlinks`, `--help`, `--version`.
+`-n`, `-s`, `-z`, `-E`/`-r`, `-l N`, `-e`, `-f -`, `-i[SUFFIX]`, `-u`,
+`--posix`, `--sandbox`, `--follow-symlinks`, `--help`, `--version`.
+`--sandbox` disables the `e`, `r`, `R`, `w`, and `W` commands and `s///w`.
 
 ## Script syntax
 
@@ -55,8 +56,10 @@ backup.
 
 - `s/regex/replacement/flags` with `g`, `p`, `w file`, `i`/`I`, `m`/`M`,
   `e`, and a numeric occurrence.
+- Replacement text supports `&`, `\1`-`\9`, and the GNU case operators
+  `\U`, `\L`, `\u`, `\l`, and `\E`.
 - `d`, `p`, `q [code]`, `Q [code]`, `n`, `N`, `P`, `D`
-- `=`, `l`, `F`, `z`
+- `=`, `l [width]`, `F`, `z`, `v [version]`
 - `y/source/destination/`
 - `h`, `H`, `g`, `G`, `x`
 - `b label`, `t label`, `T label`, and `:label`
@@ -73,7 +76,8 @@ Line numbers are cumulative across input files unless `-s` is used.
 
 Basic regular expressions support literals, `.`, `^`, `$`, `*`, `\+`, `\?`,
 `\|`, `\{m,n\}`, bracket classes and ranges, POSIX character classes, groups,
-backreferences `\1` through `\9`, and `\b`, `\B`, `\<`, `\>` word boundaries.
+backreferences `\1` through `\9`, `\b`, `\B`, `\<`, `\>`, `\``, and `\'`
+anchors, and the `\w`, `\W`, `\s`, and `\S` character classes.
 Matching is leftmost-longest. `-E`/`-r` accepts extended syntax and translates
 it to the same engine.
 

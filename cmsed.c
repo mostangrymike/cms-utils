@@ -18,6 +18,7 @@ extern int puts(const char *);
 extern int remove(const char *);
 extern int rename(const char *, const char *);
 extern int system(const char *);
+extern int strcmp(const char *, const char *);
 #endif
 
 enum {
@@ -68,6 +69,7 @@ typedef struct {
     int sub_icase;
     int sub_multiline;
     int sub_exec;
+    int list_width;
     int branch_target;
     int block_end;
     int exit_code;
@@ -107,6 +109,8 @@ static FILE *output_stream;
 static char last_parsed_regex[MAX_STRING];
 static int rx_icase;
 static int rx_multiline;
+static int list_width = 70;
+static int sandbox_mode;
 
 static char input_ids[MAX_INPUT_FILES][MAX_STRING];
 static FILE *input_preopened[MAX_INPUT_FILES];
@@ -143,6 +147,17 @@ static int is_digit(char c) {
     return c >= '0' && c <= '9';
 }
 
+static int parse_uint(const char *text) {
+    int value = 0;
+    if (!text || !*text) return -1;
+    while (*text) {
+        if (!is_digit(*text)) return -1;
+        value = value * 10 + (*text++ - '0');
+        if (value > 1000000) return -1;
+    }
+    return value;
+}
+
 static int is_space(char c) {
     return c == ' ' || c == '\t' || c == '\r';
 }
@@ -157,6 +172,11 @@ static int is_word(char c) {
 
 static char lower_char(char c) {
     if (c >= 'A' && c <= 'Z') return (char)(c - 'A' + 'a');
+    return c;
+}
+
+static char upper_char(char c) {
+    if (c >= 'a' && c <= 'z') return (char)(c - 'a' + 'A');
     return c;
 }
 
@@ -419,6 +439,24 @@ static int match_atom(const char *atom, int alen, const char *text,
         return 1;
     }
     if (atom[0] == '\\' && atom[1]) {
+        if (atom[1] == 'w' || atom[1] == 'W' ||
+            atom[1] == 's' || atom[1] == 'S') {
+            int hit;
+            if (atom[1] == 'w' || atom[1] == 'W')
+                hit = is_word(*text);
+            else
+                hit = (*text == ' ' || *text == '\t' ||
+                       *text == '\r' || *text == '\n' ||
+                       *text == '\f' || *text == '\v');
+            if (atom[1] == 'W' || atom[1] == 'S') hit = !hit;
+            *consumed = 1;
+            return *text && hit;
+        }
+        if (atom[1] == '`' || atom[1] == '\'') {
+            *consumed = 0;
+            if (atom[1] == '`') return text == base;
+            return *text == 0;
+        }
         if (atom[1] == 'b' || atom[1] == 'B' ||
             atom[1] == '<' || atom[1] == '>') {
             int before = text > base && is_word(text[-1]);
@@ -713,12 +751,29 @@ static int append_string(char *out, int used, const char *text, int count) {
     return used;
 }
 
+static int append_case(char *out, int used, const char *text, int count,
+                       int *mode, int *next) {
+    int i;
+    for (i = 0; i < count; i++) {
+        char c = text[i];
+        if (*next == 1) c = upper_char(c);
+        else if (*next == 2) c = lower_char(c);
+        else if (*mode == 1) c = upper_char(c);
+        else if (*mode == 2) c = lower_char(c);
+        *next = 0;
+        used = append_char(out, used, c);
+        if (used < 0) return -1;
+    }
+    return used;
+}
+
 static int do_substitute(char *line, SedCommand *cmd) {
     char result[MAX_RECORD];
     MatchState ms;
     int used = 0, pos = 0, start = 0, length = 0, occ = 0, changed = 0;
     int len = text_length(line), i, r, target, old_icase, old_multi;
     int last_end = -1, after_nonempty = 0;
+    int case_mode = 0, case_next = 0;
     old_icase = rx_icase;
     old_multi = rx_multiline;
     rx_icase = cmd->sub_icase;
@@ -758,37 +813,50 @@ static int do_substitute(char *line, SedCommand *cmd) {
         for (r = 0; cmd->replacement[r]; r++) {
             char c = cmd->replacement[r];
             if (c == '&') {
-                used = append_string(result, used, line + start, length);
+                used = append_case(result, used, line + start, length,
+                                   &case_mode, &case_next);
                 if (used < 0) goto too_long;
             } else if (c == '\\' && cmd->replacement[r + 1]) {
                 char next = cmd->replacement[++r];
-                if (next >= '1' && next <= '9') {
+                if (next == 'U') case_mode = 1;
+                else if (next == 'L') case_mode = 2;
+                else if (next == 'E') case_mode = 0;
+                else if (next == 'u') case_next = 1;
+                else if (next == 'l') case_next = 2;
+                else if (next >= '1' && next <= '9') {
                     int group = next - '0';
                     if (group <= ms.count && ms.start[group] >= 0 &&
                         ms.end[group] >= ms.start[group]) {
-                        used = append_string(result, used,
-                                             line + ms.start[group],
-                                             ms.end[group] - ms.start[group]);
+                        used = append_case(result, used,
+                                           line + ms.start[group],
+                                           ms.end[group] - ms.start[group],
+                                           &case_mode, &case_next);
                         if (used < 0) goto too_long;
                     }
                 } else if (next == 'n') {
-                    used = append_char(result, used, '\n');
+                    used = append_case(result, used, "\n", 1,
+                                       &case_mode, &case_next);
                 } else if (next == 't') {
-                    used = append_char(result, used, '\t');
+                    used = append_case(result, used, "\t", 1,
+                                       &case_mode, &case_next);
                 } else if (next == 'r') {
-                    used = append_char(result, used, '\r');
+                    used = append_case(result, used, "\r", 1,
+                                       &case_mode, &case_next);
                 } else if (next == 'x') {
                     char decoded;
                     const char *ptr = cmd->replacement + r - 1;
                     decode_escape(&ptr, &decoded);
-                    used = append_char(result, used, decoded);
+                    used = append_case(result, used, &decoded, 1,
+                                       &case_mode, &case_next);
                     r = (int)(ptr - cmd->replacement) - 1;
                 } else {
-                    used = append_char(result, used, next);
+                    used = append_case(result, used, &next, 1,
+                                       &case_mode, &case_next);
                 }
                 if (used < 0) goto too_long;
             } else {
-                used = append_char(result, used, c);
+                used = append_case(result, used, &c, 1,
+                                   &case_mode, &case_next);
                 if (used < 0) goto too_long;
             }
         }
@@ -851,6 +919,7 @@ static void init_command(SedCommand *command) {
     command->sub_icase = 0;
     command->sub_multiline = 0;
     command->sub_exec = 0;
+    command->list_width = 0;
     command->branch_target = -1;
     command->block_end = -1;
     command->exit_code = 0;
@@ -1105,6 +1174,13 @@ static int parse_script_record(const char *line, int script_line) {
             else if (c == 'N') command.kind = CMD_APPEND_NEXT;
             else if (c == 'P') command.kind = CMD_PRINT_FIRST;
             else command.kind = CMD_DELETE_FIRST;
+            if (c == 'l') {
+                skip_space(&text);
+                while (is_digit(*text))
+                    command.list_width = command.list_width * 10 +
+                                         *text++ - '0';
+                if (!command.list_width) command.list_width = 0;
+            }
             if (!end_segment(&text)) return 0;
         } else if (c == 's') {
             char delimiter;
@@ -1182,7 +1258,7 @@ static int parse_script_record(const char *line, int script_line) {
         } else if (c == 'a' || c == 'i' || c == 'c') {
             command.kind = c == 'a' ? CMD_APPEND :
                            c == 'i' ? CMD_INSERT : CMD_CHANGE;
-            if (*text == ' ') text++;
+            skip_space(&text);
             if (*text == '\\' && text[1] == 0) {
                 parse_pending_kind = command.kind;
                 parse_pending_index = command_count;
@@ -1192,6 +1268,10 @@ static int parse_script_record(const char *line, int script_line) {
             }
             if (*text == '\\') text++;
             text_copy(command.text, text, MAX_TEXT);
+            commands[command_count++] = command;
+            return 1;
+        } else if (c == 'v') {
+            command.kind = CMD_LABEL;
             commands[command_count++] = command;
             return 1;
         } else if (c == 'r' || c == 'w' || c == 'R' || c == 'W') {
@@ -1230,7 +1310,9 @@ static int append_pending_line(const char *line, int length) {
     }
     used = text_length(command->text);
     if (used && used < MAX_TEXT - 1) command->text[used++] = '\n';
-    for (i = 0; i < length && used < MAX_TEXT - 1; i++)
+    i = 0;
+    while (i < length && (line[i] == ' ' || line[i] == '\t')) i++;
+    for (; i < length && used < MAX_TEXT - 1; i++)
         command->text[used++] = line[i];
     command->text[used] = 0;
     if (!more) parse_pending_kind = 0;
@@ -1496,6 +1578,18 @@ static FILE *open_write(const char *name) {
 
 static int prepare_write_files(void) {
     int i;
+    if (sandbox_mode) {
+        for (i = 0; i < command_count; i++) {
+            SedCommand *command = &commands[i];
+            if (command->kind == CMD_WRITE_FILE ||
+                command->kind == CMD_WRITE_LINE ||
+                (command->kind == CMD_SUBSTITUTE &&
+                 command->sub_write_name[0])) {
+                puts("sed: e/r/w commands disabled in sandbox mode");
+                return 0;
+            }
+        }
+    }
     for (i = 0; i < command_count; i++) {
         SedCommand *command = &commands[i];
         if (command->kind == CMD_WRITE_FILE) {
@@ -1612,12 +1706,13 @@ static int append_read_line(char *buffer, int used, SedCommand *command) {
     }
 }
 
-static void list_pattern(const char *line, int terminated) {
+static void list_pattern(const char *line, int terminated, int width) {
     char out[MAX_RECORD * 2];
     int used = 0, i = 0, col = 0;
+    if (width < 1) width = 70;
     while (line[i]) {
         unsigned char c = (unsigned char)line[i++];
-        if (col >= 70) {
+        if (width > 1 && col >= width - 1) {
             out[used++] = '\\';
             out[used++] = '\n';
             col = 0;
@@ -1748,6 +1843,11 @@ static int execute_cycle(char *pattern, int *terminated) {
                     output_record(pattern, *terminated);
                 if (command->sub_exec) {
                     char executed[MAX_RECORD];
+                    if (sandbox_mode) {
+                        puts("sed: e/r/w commands disabled in sandbox mode");
+                        error_flag = 1;
+                        return 0;
+                    }
                     if (host_exec_text(pattern, executed, MAX_RECORD))
                         text_copy(pattern, executed, MAX_RECORD);
                 }
@@ -1802,6 +1902,11 @@ static int execute_cycle(char *pattern, int *terminated) {
             }
             break;
         case CMD_READ_FILE:
+            if (sandbox_mode) {
+                puts("sed: e/r/w commands disabled in sandbox mode");
+                error_flag = 1;
+                return 0;
+            }
             appended_used = append_file_text(appended, appended_used,
                                              command->text);
             if (appended_used < 0) {
@@ -1810,6 +1915,11 @@ static int execute_cycle(char *pattern, int *terminated) {
             }
             break;
         case CMD_READ_LINE:
+            if (sandbox_mode) {
+                puts("sed: e/r/w commands disabled in sandbox mode");
+                error_flag = 1;
+                return 0;
+            }
             appended_used = append_read_line(appended, appended_used,
                                              command);
             if (appended_used < 0) {
@@ -1903,7 +2013,9 @@ static int execute_cycle(char *pattern, int *terminated) {
             break;
         }
         case CMD_LIST:
-            list_pattern(pattern, *terminated);
+            list_pattern(pattern, *terminated,
+                         command->list_width ? command->list_width :
+                         list_width);
             break;
         case CMD_FILENAME:
             emit_text(current_filename, 1);
@@ -1915,8 +2027,13 @@ static int execute_cycle(char *pattern, int *terminated) {
             char executed[MAX_RECORD];
             const char *command_text =
                 command->text[0] ? command->text : pattern;
+            if (sandbox_mode) {
+                puts("sed: e/r/w commands disabled in sandbox mode");
+                error_flag = 1;
+                return 0;
+            }
             if (host_exec_text(command_text, executed, MAX_RECORD))
-                text_copy(pattern, executed, MAX_RECORD);
+                emit_text(executed, 1);
             break;
         }
         default:
@@ -2213,9 +2330,12 @@ static int host_main(int argc, char **argv) {
     last_parsed_regex[0] = 0;
     while (arg < argc && argv[arg][0] == '-') {
         if (!strcmp(argv[arg], "--")) { arg++; break; }
-        if (!strcmp(argv[arg], "--posix") || !strcmp(argv[arg], "-u") ||
-            !strcmp(argv[arg], "--sandbox") ||
-            !strcmp(argv[arg], "--follow-symlinks")) {
+        if (!strcmp(argv[arg], "--sandbox")) {
+            sandbox_mode = 1;
+            arg++;
+        } else if (!strcmp(argv[arg], "--posix") ||
+                   !strcmp(argv[arg], "-u") ||
+                   !strcmp(argv[arg], "--follow-symlinks")) {
             arg++;
         } else if (!strcmp(argv[arg], "--debug")) {
             arg++;
@@ -2237,9 +2357,18 @@ static int host_main(int argc, char **argv) {
         } else if (!strcmp(argv[arg], "-E") || !strcmp(argv[arg], "-r")) {
             ere_mode = 1;
             arg++;
-        } else if (!strcmp(argv[arg], "-l")) {
+        } else if (!strcmp(argv[arg], "-l") ||
+                   (argv[arg][0] == '-' && argv[arg][1] == 'l' &&
+                    argv[arg][2])) {
+            int width;
+            if (argv[arg][2]) width = parse_uint(argv[arg] + 2);
+            else {
+                if (++arg >= argc) return usage();
+                width = parse_uint(argv[arg]);
+            }
+            if (width < 1) return usage();
+            list_width = width;
             arg++;
-            if (arg < argc) arg++;
         } else if (argv[arg][1] == 'i') {
             in_place = 1;
             suffix = argv[arg] + 2;
@@ -2393,7 +2522,20 @@ int main(int argc, char **argv) {
             arg++;
             break;
         }
-        if (!argv[arg][1] || argv[arg][1] == 'n') {
+        if (!strcmp(argv[arg], "--sandbox")) {
+            sandbox_mode = 1;
+            arg++;
+        } else if (argv[arg][1] == 'l') {
+            int width;
+            if (argv[arg][2]) width = parse_uint(argv[arg] + 2);
+            else {
+                if (++arg >= argc) return usage();
+                width = parse_uint(argv[arg]);
+            }
+            if (width < 1) return usage();
+            list_width = width;
+            arg++;
+        } else if (!argv[arg][1] || argv[arg][1] == 'n') {
             quiet_mode = 1;
             arg++;
         } else if (argv[arg][1] == 's') {
