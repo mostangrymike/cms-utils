@@ -1688,7 +1688,9 @@ static int append_file_text(char *buffer, int used, const char *name) {
             puts("sed: appended text too long");
             return -1;
         }
+#if !defined(CMSED_HOST)
         if (c == '\r') continue;
+#endif
         buffer[used++] = (char)c;
     }
     buffer[used] = 0;
@@ -1718,7 +1720,9 @@ static int append_read_line(char *buffer, int used, SedCommand *command) {
             command->read_file = 0;
             return used;
         }
+#if !defined(CMSED_HOST)
         if (c == '\r') continue;
+#endif
         if (used + 1 >= MAX_APPEND) return -1;
         buffer[used++] = (char)c;
         if (c == '\n') {
@@ -1758,6 +1762,26 @@ static void list_pattern(const char *line, int terminated, int width) {
         } else if (c == '\t') {
             out[used++] = '\\';
             out[used++] = 't';
+            col += 2;
+        } else if (c == '\a') {
+            out[used++] = '\\';
+            out[used++] = 'a';
+            col += 2;
+        } else if (c == '\b') {
+            out[used++] = '\\';
+            out[used++] = 'b';
+            col += 2;
+        } else if (c == '\v') {
+            out[used++] = '\\';
+            out[used++] = 'v';
+            col += 2;
+        } else if (c == '\f') {
+            out[used++] = '\\';
+            out[used++] = 'f';
+            col += 2;
+        } else if (c == '\r') {
+            out[used++] = '\\';
+            out[used++] = 'r';
             col += 2;
         } else if (list_escape_byte(c)) {
             out[used++] = '\\';
@@ -2126,7 +2150,9 @@ static int input_read_record(char *out, int *terminated) {
                 *terminated = 1;
                 break;
             }
+#if !defined(CMSED_HOST)
             if (record_sep == '\n' && c == '\r') continue;
+#endif
             if (used >= MAX_RECORD - 1) {
                 puts("sed: input record too long");
                 exit_status = 2;
@@ -2157,7 +2183,9 @@ static int count_file_records(const char *fileid, unsigned long *count) {
             (*count)++;
             used = 0;
         } else {
+#if !defined(CMSED_HOST)
             if (record_sep == '\n' && c == '\r') continue;
+#endif
             used++;
             if (used >= MAX_RECORD) {
                 fclose(file);
@@ -2578,7 +2606,11 @@ static int host_main(int argc, char **argv) {
         while ((c = fgetc(stdin)) != -1) {
             fputc(c, spool);
             if (c == record_sep) { count++; used = 0; }
+#if defined(CMSED_HOST)
+            else used++;
+#else
             else if (!(record_sep == '\n' && c == '\r')) used++;
+#endif
         }
         if (used) count++;
         rewind(spool);
