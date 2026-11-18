@@ -111,6 +111,8 @@ static int rx_icase;
 static int rx_multiline;
 static int list_width = 70;
 static int sandbox_mode;
+static int posix_mode;
+#define GNU_BRE (!posix_mode || ere_mode)
 
 static char input_ids[MAX_INPUT_FILES][MAX_STRING];
 static FILE *input_preopened[MAX_INPUT_FILES];
@@ -604,11 +606,11 @@ static int match_sequence(const char *pattern, const char *text,
         rest = p + alen;
         if (*rest == '*') {
             quant = 1; minimum = 0; maximum = -1; qlen = 1;
-        } else if (rest[0] == '\\' && rest[1] == '+') {
+        } else if (GNU_BRE && rest[0] == '\\' && rest[1] == '+') {
             quant = 1; minimum = 1; maximum = -1; qlen = 2;
-        } else if (rest[0] == '\\' && rest[1] == '?') {
+        } else if (GNU_BRE && rest[0] == '\\' && rest[1] == '?') {
             quant = 1; minimum = 0; maximum = 1; qlen = 2;
-        } else if (rest[0] == '\\' && rest[1] == '{') {
+        } else if (GNU_BRE && rest[0] == '\\' && rest[1] == '{') {
             if (!parse_interval(rest, &qlen, &minimum, &maximum))
                 return 0;
             quant = 1;
@@ -646,7 +648,7 @@ static int match_pattern(const char *pattern, const char *text,
         if (pattern[i] == '\\') {
             if (pattern[i + 1] == '(') depth++;
             else if (pattern[i + 1] == ')') depth--;
-            else if (depth == 0 && pattern[i + 1] == '|') {
+            else if (GNU_BRE && depth == 0 && pattern[i + 1] == '|') {
                 if (count < 64) {
                     starts[count] = start;
                     lengths[count] = i - start;
@@ -2324,8 +2326,10 @@ static int host_main(int argc, char **argv) {
         if (!strcmp(argv[arg], "--sandbox")) {
             sandbox_mode = 1;
             arg++;
-        } else if (!strcmp(argv[arg], "--posix") ||
-                   !strcmp(argv[arg], "-u") ||
+        } else if (!strcmp(argv[arg], "--posix")) {
+            posix_mode = 1;
+            arg++;
+        } else if (!strcmp(argv[arg], "-u") ||
                    !strcmp(argv[arg], "--follow-symlinks")) {
             arg++;
         } else if (!strcmp(argv[arg], "--debug")) {
@@ -2515,6 +2519,9 @@ int main(int argc, char **argv) {
         }
         if (!strcmp(argv[arg], "--sandbox")) {
             sandbox_mode = 1;
+            arg++;
+        } else if (!strcmp(argv[arg], "--posix")) {
+            posix_mode = 1;
             arg++;
         } else if (argv[arg][1] == 'l') {
             int width;
