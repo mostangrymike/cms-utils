@@ -2332,13 +2332,80 @@ static int host_main(int argc, char **argv) {
         } else if (!strcmp(argv[arg], "-u") ||
                    !strcmp(argv[arg], "--follow-symlinks")) {
             arg++;
-        } else if (!strcmp(argv[arg], "--debug")) {
+        } else if (!strcmp(argv[arg], "--debug") ||
+                   !strcmp(argv[arg], "--unbuffered") ||
+                   !strcmp(argv[arg], "--binary") ||
+                   !strcmp(argv[arg], "-b")) {
+            arg++;
+        } else if (!strcmp(argv[arg], "--quiet") ||
+                   !strcmp(argv[arg], "--silent")) {
+            quiet_mode = 1;
+            arg++;
+        } else if (!strcmp(argv[arg], "--null-data")) {
+            nul_mode = 1;
+            arg++;
+        } else if (!strcmp(argv[arg], "--separate")) {
+            separate_files = 1;
+            arg++;
+        } else if (!strcmp(argv[arg], "--regexp-extended")) {
+            ere_mode = 1;
+            arg++;
+        } else if (!strncmp(argv[arg], "--expression=", 13)) {
+            if (!load_script_string(argv[arg] + 13)) {
+                puts("sed: invalid -e script");
+                return 4;
+            }
+            have_script = 1;
+            arg++;
+        } else if (!strcmp(argv[arg], "--expression")) {
+            if (++arg >= argc || !load_script_string(argv[arg])) {
+                puts("sed: invalid -e script");
+                return 4;
+            }
+            have_script = 1;
+            arg++;
+        } else if (!strncmp(argv[arg], "--file=", 7)) {
+            if (!load_script(argv[arg] + 7)) {
+                puts("sed: cannot read -f script");
+                return 4;
+            }
+            have_script = 1;
+            arg++;
+        } else if (!strcmp(argv[arg], "--file")) {
+            if (++arg >= argc) return usage();
+            if (!strcmp(argv[arg], "-")) {
+                if (!load_script_stream(stdin)) return 4;
+            } else if (!load_script(argv[arg])) {
+                puts("sed: cannot read -f script");
+                return 4;
+            }
+            have_script = 1;
+            arg++;
+        } else if (!strncmp(argv[arg], "--in-place=", 11)) {
+            in_place = 1;
+            suffix = argv[arg] + 11;
+            arg++;
+        } else if (!strcmp(argv[arg], "--in-place")) {
+            in_place = 1;
+            suffix = "";
+            arg++;
+        } else if (!strncmp(argv[arg], "--line-length=", 14)) {
+            int width = parse_uint(argv[arg] + 14);
+            if (width < 1) return usage();
+            list_width = width;
+            arg++;
+        } else if (!strcmp(argv[arg], "--line-length")) {
+            int width;
+            if (++arg >= argc) return usage();
+            width = parse_uint(argv[arg]);
+            if (width < 1) return usage();
+            list_width = width;
             arg++;
         } else if (!strcmp(argv[arg], "--help")) {
             usage();
             return 0;
         } else if (!strcmp(argv[arg], "--version")) {
-            puts("CMSED 0.3");
+            puts("CMSED 0.4");
             return 0;
         } else if (!strcmp(argv[arg], "-n")) {
             quiet_mode = 1;
@@ -2522,6 +2589,32 @@ int main(int argc, char **argv) {
             arg++;
         } else if (!strcmp(argv[arg], "--posix")) {
             posix_mode = 1;
+            arg++;
+        } else if (!strcmp(argv[arg], "--quiet") ||
+                   !strcmp(argv[arg], "--silent")) {
+            quiet_mode = 1;
+            arg++;
+        } else if (!strcmp(argv[arg], "--null-data")) {
+            nul_mode = 1;
+            arg++;
+        } else if (!strcmp(argv[arg], "--separate")) {
+            separate_files = 1;
+            arg++;
+        } else if (!strcmp(argv[arg], "--regexp-extended")) {
+            ere_mode = 1;
+            arg++;
+        } else if (!strcmp(argv[arg], "--in-place")) {
+            in_place = 1;
+            arg++;
+        } else if (!strncmp(argv[arg], "--line-length=", 14)) {
+            int width = parse_uint(argv[arg] + 14);
+            if (width < 1) return usage();
+            list_width = width;
+            arg++;
+        } else if (!strcmp(argv[arg], "--unbuffered") ||
+                   !strcmp(argv[arg], "--binary") ||
+                   !strcmp(argv[arg], "--debug") ||
+                   !strcmp(argv[arg], "--follow-symlinks")) {
             arg++;
         } else if (argv[arg][1] == 'l') {
             int width;
