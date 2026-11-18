@@ -978,8 +978,9 @@ static int parse_address(const char **cursor, int *kind, int *number,
     if (is_digit(*text)) {
         *kind = ADDR_LINE;
         while (is_digit(*text)) {
-            if (value > 100000000) return 0;
-            value = value * 10 + *text++ - '0';
+            if (value > 200000000) value = 200000000;
+            else value = value * 10 + (*text - '0');
+            text++;
         }
         *number = value;
         if (*text == '~') {
@@ -987,7 +988,9 @@ static int parse_address(const char **cursor, int *kind, int *number,
             text++;
             while (is_digit(*text)) {
                 digits = 1;
-                stepval = stepval * 10 + *text++ - '0';
+                if (stepval > 200000000) stepval = 200000000;
+                else stepval = stepval * 10 + (*text - '0');
+                text++;
             }
             if (!digits || stepval <= 0) return 0;
             *kind = ADDR_STEP;
