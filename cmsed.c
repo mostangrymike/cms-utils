@@ -19,6 +19,7 @@ extern int remove(const char *);
 extern int rename(const char *, const char *);
 extern int system(const char *);
 extern int strcmp(const char *, const char *);
+extern int strncmp(const char *, const char *, unsigned long);
 #endif
 
 enum {
@@ -1727,6 +1728,14 @@ static int append_read_line(char *buffer, int used, SedCommand *command) {
     }
 }
 
+static int list_escape_byte(unsigned char c) {
+    if (c < 32 || c == 127) return 1;
+#if defined(CMSED_HOST)
+    if (c >= 128) return 1;
+#endif
+    return 0;
+}
+
 static void list_pattern(const char *line, int terminated, int width) {
     char out[MAX_RECORD * 2];
     int used = 0, i = 0, col = 0;
@@ -1750,7 +1759,7 @@ static void list_pattern(const char *line, int terminated, int width) {
             out[used++] = '\\';
             out[used++] = 't';
             col += 2;
-        } else if (c < 32 || c == 127) {
+        } else if (list_escape_byte(c)) {
             out[used++] = '\\';
             out[used++] = (char)('0' + ((c >> 6) & 7));
             out[used++] = (char)('0' + ((c >> 3) & 7));
