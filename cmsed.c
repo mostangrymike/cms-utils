@@ -1648,11 +1648,7 @@ static int append_block(char *buffer, int used, const char *text) {
 static int append_file_text(char *buffer, int used, const char *name) {
     FILE *file = fopen(name, "r");
     int c;
-    if (!file) {
-        printf("sed: cannot read %s\n", name);
-        exit_status = 2;
-        return used;
-    }
+    if (!file) return used;
     while ((c = fgetc(file)) != -1) {
         if (used + 1 >= MAX_APPEND) {
             fclose(file);
@@ -1675,11 +1671,7 @@ static int append_file_text(char *buffer, int used, const char *name) {
 static int append_read_line(char *buffer, int used, SedCommand *command) {
     int c;
     if (!command->read_file) command->read_file = fopen(command->text, "r");
-    if (!command->read_file) {
-        printf("sed: cannot read %s\n", command->text);
-        exit_status = 2;
-        return used;
-    }
+    if (!command->read_file) return used;
     if (used + 1 >= MAX_APPEND) return -1;
     if (used) buffer[used++] = '\n';
     for (;;) {
