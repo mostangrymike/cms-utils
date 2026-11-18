@@ -1058,12 +1058,77 @@ static void ere_to_bre(char *out, const char *in) {
     out[j] = 0;
 }
 
-static void compile_regex(char *pattern) {
+static int regex_groups(const char *pattern) {
+    int groups = 0, i = 0;
+    while (pattern[i]) {
+        if (pattern[i] == '\\' && pattern[i + 1]) {
+            if (pattern[i + 1] == '(') groups++;
+            i += 2;
+            continue;
+        }
+        if (pattern[i] == '[') {
+            int n = class_length(pattern + i);
+            i += n ? n : 1;
+            continue;
+        }
+        i++;
+    }
+    return groups;
+}
+
+static int validate_regex(const char *pattern) {
+    int depth = 0, i = 0, groups;
+    groups = regex_groups(pattern);
+    while (pattern[i]) {
+        if (pattern[i] == '[') {
+            int n = class_length(pattern + i);
+            if (n <= 0) return 0;
+            i += n;
+            continue;
+        }
+        if (pattern[i] != '\\') { i++; continue; }
+        if (!pattern[i + 1]) return 0;
+        if (pattern[i + 1] == '(') depth++;
+        else if (pattern[i + 1] == ')') {
+            depth--;
+            if (depth < 0) return 0;
+        } else if (pattern[i + 1] == '{') {
+            int length, minimum, maximum;
+            if (!parse_interval(pattern + i, &length, &minimum, &maximum))
+                return 0;
+            i += length;
+            continue;
+        } else if (pattern[i + 1] >= '1' && pattern[i + 1] <= '9') {
+            if (pattern[i + 1] - '0' > groups) return 0;
+        }
+        i += 2;
+    }
+    return depth == 0;
+}
+
+static int validate_replacement(const char *replacement, int groups) {
+    int i = 0;
+    while (replacement[i]) {
+        if (replacement[i] != '\\' || !replacement[i + 1]) {
+            i++;
+            continue;
+        }
+        if (replacement[i + 1] >= '1' && replacement[i + 1] <= '9') {
+            if (replacement[i + 1] - '0' > groups) return 0;
+        }
+        i += 2;
+    }
+    return 1;
+}
+
+static int compile_regex(char *pattern) {
     if (ere_mode && pattern[0]) {
         char converted[MAX_STRING];
         ere_to_bre(converted, pattern);
         text_copy(pattern, converted, MAX_STRING);
     }
+    if (pattern[0] && !validate_regex(pattern)) return 0;
+    return 1;
 }
 
 static int resolve_empty_regex(char *pattern) {
@@ -1131,11 +1196,11 @@ static int parse_script_record(const char *line, int script_line) {
                 has_end = command.has_end = 1;
             }
             if (command.address_kind == ADDR_REGEX) {
-                compile_regex(command.address);
+                if (!compile_regex(command.address)) return 0;
                 if (!resolve_empty_regex(command.address)) return 0;
             }
             if (command.end_kind == ADDR_REGEX) {
-                compile_regex(command.end_address);
+                if (!compile_regex(command.end_address)) return 0;
                 if (!resolve_empty_regex(command.end_address)) return 0;
             }
             if (command.address_kind == ADDR_LINE &&
@@ -1236,15 +1301,22 @@ static int parse_script_record(const char *line, int script_line) {
                 skip_space(&text);
                 text_copy(command.sub_write_name, text, MAX_STRING);
                 command.kind = CMD_SUBSTITUTE;
-                compile_regex(command.pattern);
+                if (!compile_regex(command.pattern)) return 0;
                 if (!resolve_empty_regex(command.pattern)) return 0;
+                if (!command.pattern[0] ||
+                    !validate_replacement(command.replacement,
+                                          regex_groups(command.pattern)))
+                    return 0;
                 commands[command_count++] = command;
                 return 1;
             }
             if (!end_segment(&text)) return 0;
             command.kind = CMD_SUBSTITUTE;
-            compile_regex(command.pattern);
+            if (!compile_regex(command.pattern)) return 0;
             if (!resolve_empty_regex(command.pattern)) return 0;
+            if (!validate_replacement(command.replacement,
+                                      regex_groups(command.pattern)))
+                return 0;
         } else if (c == 'y') {
             char delimiter;
             char source[MAX_STRING], dest[MAX_STRING];
