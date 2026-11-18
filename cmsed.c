@@ -206,6 +206,24 @@ static char upper_char(char c) {
     return c;
 }
 
+static int utf8_length(const char *text) {
+#if defined(CMSED_HOST)
+    unsigned char c = (unsigned char)text[0];
+    int n, i;
+    if (c < 0x80) return 1;
+    if (c >= 0xC2 && c <= 0xDF) n = 2;
+    else if (c >= 0xE0 && c <= 0xEF) n = 3;
+    else if (c >= 0xF0 && c <= 0xF4) n = 4;
+    else return 1;
+    for (i = 1; i < n; i++)
+        if (((unsigned char)text[i] & 0xC0) != 0x80) return 1;
+    return n;
+#else
+    (void)text;
+    return 1;
+#endif
+}
+
 static int chars_equal(char a, char b) {
     if (rx_icase) return lower_char(a) == lower_char(b);
     return a == b;
@@ -528,12 +546,12 @@ static int match_atom(const char *atom, int alen, const char *text,
     if (atom[0] == '[') {
         if (!*text) return 0;
         if (!class_match(atom, *text, &used)) return 0;
-        *consumed = 1;
+        *consumed = utf8_length(text);
         return 1;
     }
     if (atom[0] == '.') {
         if (!*text) return 0;
-        *consumed = 1;
+        *consumed = utf8_length(text);
         return 1;
     }
     if (atom[0] == '^' && alen == 1) {
