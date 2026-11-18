@@ -40,7 +40,8 @@ enum {
     CMD_TEST_NOT, CMD_LABEL, CMD_APPEND, CMD_INSERT, CMD_CHANGE,
     CMD_READ_FILE, CMD_WRITE_FILE, CMD_READ_LINE, CMD_WRITE_LINE,
     CMD_NEXT, CMD_APPEND_NEXT, CMD_PRINT_FIRST, CMD_DELETE_FIRST,
-    CMD_LINE_NUMBER, CMD_LIST, CMD_FILENAME, CMD_ZAP, CMD_QUIT_NOPRINT,
+    CMD_LINE_NUMBER, CMD_LIST, CMD_FILENAME, CMD_ZAP, CMD_VERSION,
+    CMD_QUIT_NOPRINT,
     CMD_BLOCK_START, CMD_BLOCK_END, CMD_EXEC
 };
 
@@ -97,6 +98,10 @@ static SedCommand commands[MAX_COMMANDS];
 static int command_count;
 static int quiet_mode;
 static int separate_files;
+#define SED_VERSION_MAJOR 4
+#define SED_VERSION_MINOR 10
+#define SED_VERSION_PATCH 0
+
 static int nul_mode;
 static int in_place;
 static int ere_mode;
@@ -158,6 +163,23 @@ static int parse_uint(const char *text) {
         if (value > 1000000) return -1;
     }
     return value;
+}
+
+static int version_newer(const char *text) {
+    int parts[3] = { 0, 0, 0 };
+    int i = 0;
+    if (!text || !is_digit(*text)) return 1;
+    while (i < 3 && is_digit(*text)) {
+        while (is_digit(*text))
+            parts[i] = parts[i] * 10 + (*text++ - '0');
+        i++;
+        if (*text != '.') break;
+        text++;
+        if (!is_digit(*text)) return 1;
+    }
+    if (parts[0] != SED_VERSION_MAJOR) return parts[0] > SED_VERSION_MAJOR;
+    if (parts[1] != SED_VERSION_MINOR) return parts[1] > SED_VERSION_MINOR;
+    return parts[2] > SED_VERSION_PATCH;
 }
 
 static int is_space(char c) {
@@ -1273,7 +1295,15 @@ static int parse_script_record(const char *line, int script_line) {
             commands[command_count++] = command;
             return 1;
         } else if (c == 'v') {
-            command.kind = CMD_LABEL;
+            int n = 0;
+            command.kind = CMD_VERSION;
+            skip_space(&text);
+            while (text[n] && text[n] != ';' && text[n] != ' ' &&
+                   text[n] != '\t' && n < MAX_STRING - 1) {
+                command.text[n] = text[n];
+                n++;
+            }
+            command.text[n] = 0;
             commands[command_count++] = command;
             return 1;
         } else if (c == 'r' || c == 'w' || c == 'R' || c == 'W') {
@@ -2014,6 +2044,13 @@ static int execute_cycle(char *pattern, int *terminated) {
         case CMD_ZAP:
             pattern[0] = 0;
             break;
+        case CMD_VERSION:
+            if (command->text[0] && version_newer(command->text)) {
+                puts("sed: expected newer version of sed");
+                exit_status = 1;
+                return 0;
+            }
+            break;
         case CMD_EXEC: {
             char executed[MAX_RECORD];
             if (sandbox_mode) {
@@ -2306,6 +2343,22 @@ static int usage(void) {
     return 4;
 }
 
+static void print_help(void) {
+    puts("Usage: sed [OPTION]... {script} [input-file]...");
+    puts("  -n, --quiet, --silent     suppress automatic printing");
+    puts("  -e SCRIPT, --expression=SCRIPT");
+    puts("  -f FILE, --file=FILE      read script from FILE (- for stdin)");
+    puts("  -i[SUFFIX], --in-place[=SUFFIX]");
+    puts("  -l N, --line-length=N     wrap length for the l command");
+    puts("  -s, --separate            treat files separately");
+    puts("  -z, --null-data           NUL record separator");
+    puts("  -E, -r, --regexp-extended extended regular expressions");
+    puts("  --posix, --sandbox, --follow-symlinks, --debug");
+    puts("  --help, --version");
+    puts("Commands: s y d p q Q n N P D = l F z h H g G x");
+    puts("          b t T : a i c r R w W e v { }");
+}
+
 #if defined(CMSED_HOST)
 static int host_main(int argc, char **argv) {
     const char *files[MAX_INPUT_FILES];
@@ -2402,7 +2455,7 @@ static int host_main(int argc, char **argv) {
             list_width = width;
             arg++;
         } else if (!strcmp(argv[arg], "--help")) {
-            usage();
+            print_help();
             return 0;
         } else if (!strcmp(argv[arg], "--version")) {
             puts("CMSED 0.4");
@@ -2547,7 +2600,7 @@ static int host_main(int argc, char **argv) {
         if (!run_all()) {
             close_write_files();
             if (spool) fclose(spool);
-            return 8;
+            return exit_status ? exit_status : 8;
         }
     } else {
         for (i = 0; i < file_count; i++) {
@@ -2584,7 +2637,13 @@ int main(int argc, char **argv) {
             arg++;
             break;
         }
-        if (!strcmp(argv[arg], "--sandbox")) {
+        if (!strcmp(argv[arg], "--help")) {
+            print_help();
+            return 0;
+        } else if (!strcmp(argv[arg], "--version")) {
+            puts("CMSED 0.4");
+            return 0;
+        } else if (!strcmp(argv[arg], "--sandbox")) {
             sandbox_mode = 1;
             arg++;
         } else if (!strcmp(argv[arg], "--posix")) {
@@ -2721,7 +2780,7 @@ int main(int argc, char **argv) {
     if (!in_place) {
         if (!run_all()) {
             close_write_files();
-            return 8;
+            return exit_status ? exit_status : 8;
         }
     } else {
         for (i = 0; i < input_count; i++) {
